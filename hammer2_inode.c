@@ -601,12 +601,12 @@ hammer2_inode_drop(hammer2_inode_t *ip)
  * cleanly.
  */
 int
-hammer2_igetv(hammer2_inode_t *ip, int flags, struct inode **vpp)
+hammer2_igetv(hammer2_inode_t *ip, int flags, void *vpp)
 {
 	(void)ip;
 	(void)flags;
 	if (vpp)
-		*vpp = NULL;
+		*(void **)vpp = NULL;
 	return -ENOSYS;
 }
 

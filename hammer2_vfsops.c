@@ -48,7 +48,7 @@ static int hammer2_recovery(hammer2_dev_t *);
 static int hammer2_fixup_pfses(hammer2_dev_t *);
 static int hammer2_remount_impl(hammer2_dev_t *);
 static int hammer2_remount(hammer2_dev_t *, struct mount *);
-static int hammer2_statfs(struct mount *, struct statfs *);
+static int hammer2_statfs(struct mount *, struct h2statfs *);
 static void hammer2_update_pmps(hammer2_dev_t *);
 static void hammer2_mount_helper(struct mount *, hammer2_pfs_t *);
 static void hammer2_unmount_helper(struct mount *, hammer2_pfs_t *,
@@ -291,8 +291,8 @@ hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
 		hammer2_inum_hash_init(pmp);
 
 		KKASSERT((HAMMER2_IHASH_SIZE & (HAMMER2_IHASH_SIZE - 1)) == 0);
-		pmp->ipdep_lists = hashinit(HAMMER2_IHASH_SIZE, M_HAMMER2,
-		    &pmp->ipdep_mask);
+		pmp->ipdep_lists = (hammer2_ipdep_list_t *)hashinit(
+		    HAMMER2_IHASH_SIZE, M_HAMMER2, &pmp->ipdep_mask);
 		KKASSERT(HAMMER2_IHASH_SIZE == pmp->ipdep_mask + 1);
 
 		if (ripdata) {
@@ -663,11 +663,8 @@ hammer2_mount(struct mount *mp)
 			TAILQ_FOREACH(e_tmp, &hmp_tmp->devvp_list, entry) {
 				devvp_found = 0;
 				TAILQ_FOREACH(e, &devvpl, entry) {
-					KKASSERT(e->devvp);
-					if (e_tmp->devvp == e->devvp)
-						devvp_found = 1;
-					if (e_tmp->devvp->v_rdev &&
-					    e_tmp->devvp->v_rdev == e->devvp->v_rdev)
+					KKASSERT(e->bdev);
+					if (e_tmp->bdev == e->bdev)
 						devvp_found = 1;
 				}
 				if (!devvp_found)
@@ -685,8 +682,8 @@ next_hmp:
 		 */
 		if (hmp == NULL) {
 			TAILQ_FOREACH(e, &devvpl, entry) {
-				KKASSERT(e->devvp);
-				error = 0; /* vfs_mountedon(e->devvp); */
+				KKASSERT(e->bdev);
+				error = 0; /* port note: BSD vfs_mountedon(e->bdev) */
 				if (error) {
 					hprintf("%s mounted %d\n", e->path,
 					    error);
@@ -815,7 +812,8 @@ next_hmp:
 
 		/* Move devvpl entries to hmp. */
 		TAILQ_INIT(&hmp->devvp_list);
-		while ((e = TAILQ_FIRST(&devvpl)) != NULL) {
+		while ((e = list_first_entry_or_null(&devvpl.head,
+		    hammer2_devvp_t, entry)) != NULL) {
 			TAILQ_REMOVE(&devvpl, e, entry);
 			TAILQ_INSERT_TAIL(&hmp->devvp_list, e, entry);
 		}
@@ -1387,7 +1385,8 @@ hammer2_recovery(hammer2_dev_t *hmp)
 	error = hammer2_recovery_scan(hmp, parent, &info, sync_tid);
 	hammer2_chain_lookup_done(parent);
 
-	while ((elm = TAILQ_FIRST(&info.list)) != NULL) {
+	while ((elm = list_first_entry_or_null(&info.list.head,
+	    struct hammer2_recovery_elm, entry)) != NULL) {
 		TAILQ_REMOVE(&info.list, elm, entry);
 		parent = elm->chain;
 		sync_tid = elm->sync_tid;
@@ -1590,18 +1589,18 @@ hammer2_remount_impl(hammer2_dev_t *hmp)
 
 	for (i = 0; i < hmp->nvolumes; ++i) {
 		vol = &hmp->volumes[i];
-		error = hammer2_access_devvp(vol->dev->devvp, 0);
+		error = hammer2_access_devvp(vol->dev->bdev, 0);
 		if (error)
 			return (error);
 	}
 
 	for (i = 0; i < hmp->nvolumes; ++i) {
 		vol = &hmp->volumes[i];
-		error = hammer2_getw_devvp(vol->dev->devvp);
+		error = hammer2_getw_devvp(vol->dev->bdev);
 		if (error) {
 			for (j = 0; j < i; ++j) {
 				vol = &hmp->volumes[j];
-				hammer2_putw_devvp(vol->dev->devvp);
+				hammer2_putw_devvp(vol->dev->bdev);
 			}
 			return (error);
 		}
@@ -1670,7 +1669,7 @@ hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 {
 	hammer2_inode_t *ip;
 	hammer2_depend_t *depend, *depend_next;
-	struct vnode *vp;
+	struct inode *vp;
 	uint32_t pass2;
 	int error, dorestart;
 
@@ -1710,10 +1709,13 @@ restart:
 	 * marked pass2 are moved.
 	 */
 	hammer2_spin_ex(&pmp->list_spin);
-	depend_next = TAILQ_FIRST(&pmp->depq);
+	depend_next = list_first_entry_or_null(&pmp->depq.head,
+	    hammer2_depend_t, entry);
 
 	while ((depend = depend_next) != NULL) {
-		depend_next = TAILQ_NEXT(depend, entry);
+		depend_next = list_next_entry(depend, entry);
+		if (&depend_next->entry == &pmp->depq.head)
+			depend_next = NULL;
 		if (dorestart && depend->pass2 == 0)
 			continue;
 		TAILQ_FOREACH(ip, &depend->sideq, qentry) {
@@ -1742,7 +1744,8 @@ restart:
 	 * may hold a vnode lock while doing so.
 	 */
 	hammer2_spin_ex(&pmp->list_spin);
-	while ((ip = TAILQ_FIRST(&pmp->syncq)) != NULL) {
+	while ((ip = list_first_entry_or_null(&pmp->syncq.head,
+	    hammer2_inode_t, qentry)) != NULL) {
 		/*
 		 * Remove the inode from the SYNCQ, transfer the syncq ref
 		 * to us.  We must clear SYNCQ to allow any potential
@@ -1790,27 +1793,21 @@ restart:
 		 * the whole SIDEQ back to SYNCQ when we restart.
 		 */
 		vp = ip->vp; /* NULL after vflush() */
+		/*
+		 * Port note: BSD takes vget(vp, LK_EXCLUSIVE|LK_NOWAIT) here
+		 * to prevent the vnode being recycled.  Linux equivalent is
+		 * igrab() (which returns NULL on dying inodes); if vp is
+		 * being recycled the syncer simply skips this inode and
+		 * lets writeback handle it.
+		 */
 		if (vp) {
-			if (vget(vp, LK_EXCLUSIVE|LK_NOWAIT/*|LK_INTERLOCK*/)) {
-				/*
-				 * Failed to get the vnode, requeue the inode
-				 * (PASS2 is already set so it will be found
-				 * again on the restart).  Then unlock.
-				 */
+			if (!igrab(vp)) {
 				vp = NULL;
 				dorestart |= 1;
-				debug_hprintf("inum %016llx vget failed\n",
-				    (long long)ip->meta.inum);
 				hammer2_mtx_ex(&ip->lock);
 				hammer2_inode_delayed_sideq(ip);
 				hammer2_mtx_unlock(&ip->lock);
 				hammer2_inode_drop(ip);
-
-				/*
-				 * If PASS2 was previously set we might
-				 * be looping too hard, ask for a delay
-				 * along with the restart.
-				 */
 				if (pass2 & HAMMER2_INODE_SYNCQ_PASS2)
 					dorestart |= 2;
 				hammer2_spin_ex(&pmp->list_spin);
@@ -1835,7 +1832,7 @@ restart:
 			hammer2_mtx_unlock(&ip->lock);
 			hammer2_inode_drop(ip);
 			if (vp)
-				vput(vp);
+				iput(vp);
 			dorestart |= 1;
 			hammer2_spin_ex(&pmp->list_spin);
 			continue;
@@ -1846,12 +1843,17 @@ restart:
 		 * not NULL that will also be exclusively locked.  Do the
 		 * meat of the flush.
 		 */
-		if (vp && (vp->v_type != VCHR || vp->v_rdev)) {
-			error = vn_fsync_buf(vp, MNT_WAIT); /* vop_stdfsync() */
+		/*
+		 * Port note: BSD calls vn_fsync_buf(vp, MNT_WAIT) to flush
+		 * the vnode's dirty buffers.  Linux equivalent is
+		 * write_inode_now(vp, 1) or filemap_write_and_wait().
+		 */
+		if (vp && !S_ISCHR(vp->i_mode)) {
+			error = write_inode_now(vp, 1);
 			if (error) {
 				hprintf("inum %016llx vnode flush failed %d\n",
 				    (long long)ip->meta.inum, error);
-				error = 0; /* XXX */
+				error = 0;
 			}
 		}
 
@@ -1905,7 +1907,7 @@ restart:
 			} else {
 				hammer2_inode_delayed_sideq(ip);
 			}
-			vput(vp);
+			iput(vp);
 			vp = NULL; /* safety */
 		}
 		atomic_clear_int(&ip->flags, HAMMER2_INODE_SYNCQ_PASS2);
@@ -1967,7 +1969,7 @@ restart:
 }
 
 static int
-hammer2_vget(struct mount *mp, ino_t ino, int flags, struct vnode **vpp)
+hammer2_vget(struct mount *mp, ino_t ino, int flags, struct inode **vpp)
 {
 	hammer2_pfs_t *pmp = MPTOPMP(mp);
 	hammer2_inode_t *ip;
@@ -2008,7 +2010,7 @@ hammer2_vget(struct mount *mp, ino_t ino, int flags, struct vnode **vpp)
 }
 
 static int
-hammer2_root(struct mount *mp, int flags, struct vnode **vpp)
+hammer2_root(struct mount *mp, int flags, struct inode **vpp)
 {
 	hammer2_pfs_t *pmp = MPTOPMP(mp);
 	hammer2_xop_ipcluster_t *xop;
@@ -2029,7 +2031,8 @@ hammer2_root(struct mount *mp, int flags, struct vnode **vpp)
 		error = hammer2_xop_collect(&xop->head, 0);
 
 		if (error == 0) {
-			meta = &hammer2_xop_gdata(&xop->head)->ipdata.meta;
+			meta = &((const hammer2_media_data_t *)
+			    hammer2_xop_gdata(&xop->head))->ipdata.meta;
 			pmp->iroot->meta = *meta;
 			pmp->inode_tid = meta->pfs_inum + 1;
 			hammer2_xop_pdata(&xop->head);
@@ -2071,13 +2074,13 @@ hammer2_root(struct mount *mp, int flags, struct vnode **vpp)
 }
 
 static int
-hammer2_statfs(struct mount *mp, struct statfs *sbp)
+hammer2_statfs(struct mount *mp, struct h2statfs *sbp)
 {
 	hammer2_pfs_t *pmp = MPTOPMP(mp);
 	hammer2_dev_t *hmp;
 	hammer2_blockref_t bref;
-	struct ucred *cred = curthread->td_ucred;
-	struct statfs tmp;
+	struct ucred *cred = NULL;	/* Linux: caller-supplied via VFS callback */
+	struct h2statfs tmp;
 	uint64_t adj;
 	int i;
 
@@ -2125,7 +2128,7 @@ hammer2_statfs(struct mount *mp, struct statfs *sbp)
 }
 
 static int
-hammer2_fhtovp(struct mount *mp, struct fid *fhp, int flags, struct vnode **vpp)
+hammer2_fhtovp(struct mount *mp, struct fid *fhp, int flags, struct inode **vpp)
 {
 	hammer2_inode_t *ip;
 	hammer2_tid_t inum;
@@ -2145,7 +2148,10 @@ hammer2_fhtovp(struct mount *mp, struct fid *fhp, int flags, struct vnode **vpp)
 	}
 
 	ip = VTOI(*vpp);
-	vnode_create_vobject(*vpp, ip->meta.size, curthread);
+	(void)ip;
+	/* Port note: BSD vnode_create_vobject backs the vnode with a VM
+	 * object for mmap; Linux handles this automatically via the page
+	 * cache once the inode is wired to a struct address_space. */
 
 	return (error);
 }

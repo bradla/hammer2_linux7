@@ -48,9 +48,9 @@
  * against a read-only mounted device, but FreeBSD does not.
  */
 static int
-hammer2_is_rdonly(const struct super_block *sb)
+hammer2_is_rdonly(const struct mount *mp)
 {
-	if (sb && (sb->s_flags & SB_RDONLY)) {
+	if (mp && (mp->mnt_flag & MNT_RDONLY)) {
 		hprintf("read-only mounted\n");
 		return 1;
 	}

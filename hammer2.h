@@ -162,6 +162,7 @@ struct hammer2_depend;
 struct hammer2_inode;
 struct hammer2_dev;
 struct hammer2_pfs;
+struct hammer2_xop_head;
 union hammer2_xop;
 
 typedef struct hammer2_io hammer2_io_t;
@@ -347,6 +348,15 @@ hammer2_inode_t *hammer2_inode_create_pfs(hammer2_pfs_t *spmp,
 		const char *name, size_t name_len, int *errorp);
 int  hammer2_inode_chain_sync(hammer2_inode_t *ip);
 int  hammer2_inode_chain_flush(hammer2_inode_t *ip, int flags);
+int  hammer2_inode_chain_des(hammer2_inode_t *ip);
+int  hammer2_inode_chain_ins(hammer2_inode_t *ip);
+hammer2_inode_t *hammer2_inode_create_normal(hammer2_inode_t *pip,
+		struct vattr *vap, struct ucred *cred,
+		hammer2_key_t inum, int *errorp);
+int  hammer2_inode_unlink_finisher(hammer2_inode_t *ip, struct inode **vprp);
+void hammer2_inode_depend(hammer2_inode_t *ip, hammer2_inode_t *related);
+int  hammer2_dirent_create(hammer2_inode_t *dip, const char *name,
+		size_t name_len, hammer2_key_t inum, uint8_t type);
 hammer2_key_t hammer2_inode_data_count(const hammer2_inode_t *ip);
 hammer2_key_t hammer2_inode_inode_count(const hammer2_inode_t *ip);
 
@@ -359,11 +369,19 @@ void hammer2_trans_manage_init(hammer2_pfs_t *pmp);
 void hammer2_inum_hash_init(hammer2_pfs_t *pmp);
 void hammer2_inum_hash_destroy(hammer2_pfs_t *pmp);
 void hammer2_inode_delayed_sideq(hammer2_inode_t *ip);
-/* hammer2_inode_get and hammer2_inode_lock_temp_{release,restore} are
- * defined static inside hammer2_inode.c -- no extern decl needed. */
+hammer2_inode_t *hammer2_inode_get(hammer2_pfs_t *pmp,
+		struct hammer2_xop_head *xop, hammer2_tid_t inum, int idx);
+void hammer2_trans_clearflags(hammer2_pfs_t *pmp, uint32_t flags);
+void hammer2_print_iostat(const struct hammer2_iostat *ios, const char *msg);
 /* hammer2_assert_inode_meta is defined as a static inline below. */
 int  hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor);
-int  hammer2_sync(void *mp, int waitfor);
+int  hammer2_sync(struct mount *mp, int waitfor);
+
+/* Lifted from hammer2_bulkfree.c so other TUs can name the type. */
+typedef struct hammer2_chain_save {
+	struct list_head	entry;	/* TAILQ_ENTRY equivalent */
+	hammer2_chain_t		*chain;
+} hammer2_chain_save_t;
 hammer2_pfs_t *hammer2_pfsalloc(hammer2_chain_t *chain,
 		const hammer2_inode_data_t *ripdata,
 		hammer2_dev_t *force_local);
@@ -460,9 +478,10 @@ hammer2_chain_t *hammer2_inode_chain_and_parent(hammer2_inode_t *ip,
  * The HAMMER2 callers use it as a throttle/yield, so a plain interruptible
  * sleep with the requested tick count is functionally equivalent.
  */
+/* Statement-expression form so call sites can use tsleep as an rvalue. */
 #define tsleep(ch, prio, label, ticks) \
-	do { (void)(ch); (void)(prio); (void)(label); \
-	     schedule_timeout_uninterruptible((ticks) ?: 1); } while (0)
+	({ (void)(ch); (void)(prio); (void)(label); \
+	   schedule_timeout_uninterruptible((ticks) ?: 1); 0; })
 
 /* BSD's `hz` is the same as Linux's HZ. */
 #ifndef hz
@@ -487,6 +506,8 @@ int hammer2_cluster_check(struct hammer2_cluster *cluster, hammer2_key_t key, in
 uint8_t hammer2_cluster_type(const struct hammer2_cluster *cluster);
 void hammer2_cluster_unhold(struct hammer2_cluster *cluster);
 void hammer2_cluster_rehold(struct hammer2_cluster *cluster);
+void hammer2_cluster_bref(const struct hammer2_cluster *cluster,
+		hammer2_blockref_t *bref);
 
 /*
  * XOP storage_func entry points.  Each has the signature
@@ -772,6 +793,7 @@ struct hammer2_inode {
     uint8_t                  comp_heuristic;
     int                      ipdep_idx;
     int                      in_seek;
+    char                     clusterw[64];  /* BSD per-inode cluster ctx (stub) */
 };
 
 /*
@@ -1094,6 +1116,7 @@ struct hammer2_dev {
     hammer2_mtx_t            iohash_lock;
     hammer2_pfs_t            *spmp;
     struct block_device      *bdev;
+    struct block_device      *devvp;       /* root volume bdev (set during mount) */
     hammer2_chain_t          vchain;
     hammer2_chain_t          fchain;
     hammer2_volume_data_t    voldata;
@@ -1133,7 +1156,7 @@ struct hammer2_pfs {
     hammer2_lk_t             trans_lock;
     hammer2_lkc_t            trans_cv;
     struct super_block       *sb;
-    void                     *mp;       /* BSD mount-point alias (== sb on Linux) */
+    struct mount             *mp;       /* BSD struct-mount shim (sibling of sb) */
     struct uuid              pfs_clid;
     hammer2_trans_t          trans;
     hammer2_inode_t          *iroot;
@@ -1294,5 +1317,41 @@ hammer2_assert_inode_meta(const hammer2_inode_t *ip)
     WARN_ON(!ip);
     WARN_ON(!ip->meta.type);
 }
+
+/* hammer2_ondisk.c symbols */
+int  hammer2_open_devvp(void *mp, const hammer2_devvp_list_t *devvpl);
+int  hammer2_close_devvp(const hammer2_devvp_list_t *devvpl);
+int  hammer2_init_devvp(const void *mp, const char *blkdevs,
+		hammer2_devvp_list_t *devvpl);
+void hammer2_cleanup_devvp(hammer2_devvp_list_t *devvpl);
+int  hammer2_init_volumes(const hammer2_devvp_list_t *devvpl,
+		hammer2_volume_t *volumes, hammer2_volume_data_t *rootvoldata,
+		int *rootvolzone, struct block_device **rootvoldevvp);
+int  hammer2_access_devvp(struct block_device *bdev, int rdonly);
+int  hammer2_getw_devvp(struct block_device *bdev);
+int  hammer2_putw_devvp(struct block_device *bdev);
+int  hammer2_getnewfsid(void *mp);
+
+/* hammer2_io.c symbols */
+void hammer2_io_hash_init(hammer2_dev_t *hmp);
+void hammer2_io_hash_destroy(hammer2_dev_t *hmp);
+void hammer2_io_hash_cleanup_all(hammer2_dev_t *hmp);
+hammer2_io_t *hammer2_io_getblk(hammer2_dev_t *hmp, int btype,
+		hammer2_off_t lbase, int lsize, int op);
+
+/* hammer2_cluster.c */
+void hammer2_dummy_xop_from_chain(struct hammer2_xop_head *xop,
+		hammer2_chain_t *chain);
+
+/* hammer2_bulkfree.c */
+void hammer2_bulkfree_init(hammer2_dev_t *hmp);
+void hammer2_bulkfree_uninit(hammer2_dev_t *hmp);
+
+/* hammer2_vfsops.c-internal helpers used cross-file */
+void hammer2_bioq_sync(hammer2_pfs_t *pmp);
+struct vop_strategy_args;
+int hammer2_strategy(struct vop_strategy_args *ap);
+int  hammer2_igetv(hammer2_inode_t *ip, int flags, void *vpp);
+#define wakeup(c)	hammer2_mtx_wakeup((void *)(c))
 
 #endif /* !_HAMMER2_H_ */

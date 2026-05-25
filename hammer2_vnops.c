@@ -36,19 +36,14 @@
  */
 
 #include "hammer2.h"
-
-#include <sys/limits.h>
-#include <sys/dirent.h>
-#include <sys/fcntl.h>
-#include <sys/namei.h>
-#include <sys/uio.h>
-#include <sys/unistd.h>
-#include <sys/priv.h>
-#include <sys/vmmeter.h>
-
-#include <vm/vm.h>
-#include <vm/vm_extern.h>
-#include <vm/vnode_pager.h>
+#include "hammer2_bsdvfs.h"
+#include <linux/fs.h>
+#include <linux/pagemap.h>
+#include <linux/buffer_head.h>
+#include <linux/uio.h>
+#include <linux/limits.h>
+#include <linux/dcache.h>
+#include <linux/uaccess.h>
 
 static void hammer2_truncate_file(hammer2_inode_t *, hammer2_key_t);
 static void hammer2_extend_file(hammer2_inode_t *, hammer2_key_t, int);
@@ -590,7 +585,7 @@ static int
 hammer2_write_dirent(struct uio *uio, ino_t d_fileno, uint8_t d_type,
     uint16_t d_namlen, const char *d_name, int *errorp)
 {
-	struct dirent dirent;
+	struct h2dirent dirent;
 	size_t reclen;
 
 	reclen = _GENERIC_DIRLEN(d_namlen);
@@ -699,7 +694,8 @@ hammer2_readdir(struct vop_readdir_args *ap)
 		hammer2_cluster_bref(&xop->head.cluster, &bref);
 
 		if (bref.type == HAMMER2_BREF_TYPE_INODE) {
-			ripdata = &hammer2_xop_gdata(&xop->head)->ipdata;
+			ripdata = &((const hammer2_media_data_t *)
+			    hammer2_xop_gdata(&xop->head))->ipdata;
 			dtype = hammer2_get_dtype(ripdata->meta.type);
 			saveoff = bref.key & HAMMER2_DIRHASH_USERMSK;
 			r = hammer2_write_dirent(uio,
@@ -719,7 +715,8 @@ hammer2_readdir(struct vop_readdir_args *ap)
 			if (namlen <= sizeof(bref.check.buf))
 				dname = bref.check.buf;
 			else
-				dname = hammer2_xop_gdata(&xop->head)->buf;
+				dname = ((const hammer2_media_data_t *)
+				    hammer2_xop_gdata(&xop->head))->buf;
 			r = hammer2_write_dirent(uio, bref.embed.dirent.inum,
 			    dtype, namlen, dname, &error);
 			if (namlen > sizeof(bref.check.buf))
@@ -782,7 +779,7 @@ done:
 static int
 hammer2_read_file(hammer2_inode_t *ip, struct uio *uio, int ioflag)
 {
-	struct vnode *vp = ip->vp;
+	struct vnode *vp = (struct vnode *)ip->vp;
 	struct buf *bp;
 	hammer2_off_t isize;
 	hammer2_key_t lbase;
@@ -878,7 +875,7 @@ static int
 hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
     struct ucred *cred)
 {
-	struct vnode *vp = ip->vp;
+	struct vnode *vp = (struct vnode *)ip->vp;
 	struct buf *bp;
 	hammer2_key_t old_eof, new_eof, lbase;
 	daddr_t lbn;
@@ -1245,7 +1242,7 @@ hammer2_bmap_impl(struct vop_bmap_args *ap)
 	int error;
 
 	if (ap->a_bop != NULL)
-		*ap->a_bop = &hmp->devvp->v_bufobj;
+		*ap->a_bop = NULL;	/* port stub: no GEOM bufobj on Linux */
 	if (ap->a_bnp == NULL)
 		return (0);
 	if (ap->a_runp != NULL)
@@ -1288,7 +1285,7 @@ hammer2_bmap(struct vop_bmap_args *ap)
 		return (hammer2_bmap_impl(ap));
 
 	if (ap->a_bop != NULL)
-		*ap->a_bop = &ap->a_vp->v_bufobj;
+		*ap->a_bop = &ap->a_vp->v_bufobj;	/* shim has v_bufobj */
 	if (ap->a_bnp != NULL)
 		*ap->a_bnp = ap->a_bn;
 	if (ap->a_runp != NULL)

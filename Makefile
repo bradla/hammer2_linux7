@@ -22,14 +22,11 @@ hammer2-y := \
 	hammer2_ondisk.o \
 	hammer2_ioctl.o \
 	hammer2_strategy.o \
-	hammer2_inode.o
-
-# PENDING -- these need substantial Linux-native rewrites, not just shims:
-#	hammer2_vfsops.o   (mount path: struct mount -> struct super_block,
-#	                    file_system_type, fs_context, mount_bdev)
-#	hammer2_vnops.o    (vnode ops: VOP_* -> struct file_operations /
-#	                    inode_operations, dentry walk, page cache)
-
+	hammer2_inode.o \
+	hammer2_vfsops.o \
+	hammer2_init.o \
+	hammer2_vnops.o
+	
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 

@@ -44,6 +44,21 @@
 #include <linux/sched.h>
 #include <linux/jiffies.h>
 #include <linux/types.h>
+#include <linux/limits.h>
+
+/* C99 stdint.h limits -- not always present in kernel headers. */
+#ifndef UINT32_MAX
+#define UINT32_MAX	(0xffffffffU)
+#endif
+#ifndef UINT64_MAX
+#define UINT64_MAX	(0xffffffffffffffffULL)
+#endif
+#ifndef INT32_MAX
+#define INT32_MAX	(0x7fffffff)
+#endif
+#ifndef INT64_MAX
+#define INT64_MAX	(0x7fffffffffffffffLL)
+#endif
 #include <asm/barrier.h>
 #include <asm/processor.h>
 
@@ -234,6 +249,146 @@ static inline int vfs_filteropt(void *opts, const char **legal)
 #define MPTOPMP(sb)	((hammer2_pfs_t *)((struct super_block *)(sb))->s_fs_info)
 
 /*
+ * BSD struct mount stub.  HAMMER2's vfsops reads a handful of fields.
+ * On Linux these are spread across struct super_block / file_system_type;
+ * this stub lets the code compile -- a real port replaces every call site
+ * with the proper Linux API.
+ */
+/*
+ * BSD struct statfs collides with Linux's UAPI struct of the same name.
+ * Use a distinct port-internal type and #define statfs to it in this TU.
+ */
+/*
+ * BSD struct statfs has different fields from Linux's UAPI struct statfs.
+ * Wrap it in an anonymous struct inside struct mount so callers using
+ * `struct statfs *` (BSD style) can be patched to use `typeof(mp->mnt_stat) *`
+ * or be rewritten.  Inside struct mount we just inline the fields.
+ */
+/* Port-internal statfs struct (BSD field layout). */
+struct h2statfs {
+	long			f_iosize;
+	long			f_bsize;
+	char			f_mntfromname[MNAMELEN];
+	char			f_mntonname[MNAMELEN];
+	struct { int val[2]; } f_fsid;
+	uint64_t		f_blocks;
+	uint64_t		f_bfree;
+	uint64_t		f_bavail;
+	uint64_t		f_files;
+	uint64_t		f_ffree;
+};
+
+struct mount {
+	int				mnt_flag;
+	int				mnt_kern_flag;
+	void				*mnt_data;
+	void				*mnt_optnew;
+	struct h2statfs			mnt_stat;
+	void				*mnt_vfc;
+	long				mnt_iosize_max;
+};
+
+#define MNT_ILOCK(mp)		do { (void)(mp); } while (0)
+#define MNT_IUNLOCK(mp)		do { (void)(mp); } while (0)
+#define MNT_KERN_LOOKUP_SHARED	0
+#define MNT_KERN_EXTENDED_SHARED 0
+
+/* BSD mount kernel-flag bits (vfsops sets these on mp->mnt_kern_flag). */
+#ifndef MNTK_LOOKUP_SHARED
+#define MNTK_LOOKUP_SHARED	0
+#endif
+#ifndef MNTK_EXTENDED_SHARED
+#define MNTK_EXTENDED_SHARED	0
+#endif
+#ifndef MNTK_USES_BCACHE
+#define MNTK_USES_BCACHE	0
+#endif
+#ifndef FORCECLOSE
+#define FORCECLOSE	0
+#endif
+
+/* BSD qaddr_t / caddr_t aliases. */
+typedef long *qaddr_t;
+#ifndef caddr_t
+typedef char *caddr_t;
+#endif
+
+/*
+ * curthread maps to Linux's `current` task pointer.  BSD treats it as a
+ * struct thread *, which is structurally equivalent to struct task_struct *
+ * for our purposes; declare struct thread as an alias and let casts work.
+ */
+#define curthread	((struct thread *)current)
+struct thread;
+
+/* BSD struct fid is the NFS-style file handle.  Linux uses struct fid in
+ * <linux/exportfs.h> with a different shape.  Stub for HAMMER2's fhtovp
+ * callback which we don't actually wire up. */
+struct fid {
+	unsigned short	fid_len;
+	unsigned short	fid_reserved;
+	char		fid_data[28];
+};
+
+/* ino_t is already typedef'd by <linux/types.h>; no shim needed. */
+
+/* BSD LK_* lock flags used in cleanup paths -- map to no-ops on Linux. */
+#ifndef LK_EXCLUSIVE
+#define LK_EXCLUSIVE	0
+#define LK_SHARED	0
+#define LK_NOWAIT	0
+#define LK_RETRY	0
+#define LK_INTERLOCK	0
+#define LK_NOWITNESS	0
+#endif
+
+/* BSD sleep priority flags -- unused on Linux. */
+#ifndef PCATCH
+#define PCATCH	0
+#define PRIBIO	0
+#endif
+
+/* BSD vflush() forcibly invalidates all vnodes of a mount; on Linux this
+ * is the kernel's job during ->kill_sb.  Stub to success. */
+static inline int vflush(struct mount *mp, int rootrefs, int flags, void *td)
+{
+	(void)mp; (void)rootrefs; (void)flags; (void)td;
+	return 0;
+}
+static inline void vfs_mountedfrom(struct mount *mp, const char *name)
+{
+	(void)mp; (void)name;
+}
+static inline int vfs_flagopt(void *opts, const char *name, int *flagp, int flag)
+{
+	(void)opts; (void)name; (void)flagp; (void)flag;
+	return 0;
+}
+
+/*
+ * BSD struct vfsops is the per-fstype dispatch table.  Linux uses
+ * struct file_system_type registered via register_filesystem().  Provide
+ * a stub struct so the static initializer compiles; the actual VFS
+ * registration is done elsewhere via a Linux file_system_type.
+ */
+struct vfsconf;
+struct vfsops {
+	int  (*vfs_init)(struct vfsconf *);
+	int  (*vfs_uninit)(struct vfsconf *);
+	int  (*vfs_mount)(struct mount *);
+	int  (*vfs_unmount)(struct mount *, int);
+	int  (*vfs_sync)(struct mount *, int);
+	int  (*vfs_vget)(struct mount *, ino_t, int, struct inode **);
+	int  (*vfs_root)(struct mount *, int, struct inode **);
+	int  (*vfs_statfs)(struct mount *, struct h2statfs *);
+	int  (*vfs_fhtovp)(struct mount *, struct fid *, int, struct inode **);
+};
+#define VFS_SET(ops, name, flag) \
+	static int __maybe_unused __h2_vfs_set_##name = 0
+#define MODULE_VERSION(name, ver) \
+	static int __maybe_unused __h2_modver_##name = (ver)
+
+/*
  * BSD vnode type constants.  Linux has no equivalent enum (file type lives
  * in inode->i_mode via S_IF*).  HAMMER2 uses these only as opaque tags in
  * mapping functions, so we map them to the corresponding DT_* constants
@@ -317,11 +472,25 @@ static inline int hammer2_copyin(const void __user *user, void *kern, size_t n)
  * dispatch on Linux uses struct iattr / struct mnt_idmap differently.
  */
 struct vattr {
-	mode_t		va_mode;
-	uid_t		va_uid;
-	gid_t		va_gid;
-	dev_t		va_rdev;
-	uint8_t		va_type;	/* VBAD / VDIR / VREG / ... */
+	mode_t			va_mode;
+	uid_t			va_uid;
+	gid_t			va_gid;
+	dev_t			va_rdev;
+	uint8_t			va_type;	/* VBAD / VDIR / VREG / ... */
+	uint64_t		va_fsid;
+	uint64_t		va_fileid;
+	uint64_t		va_nlink;
+	uint64_t		va_size;
+	uint32_t		va_flags;
+	struct timespec64	va_ctime;
+	struct timespec64	va_mtime;
+	struct timespec64	va_atime;
+	struct timespec64	va_birthtime;
+	uint64_t		va_gen;
+	uint32_t		va_blocksize;
+	uint64_t		va_bytes;
+	uint64_t		va_filerev;
+	int			va_vaflags;
 };
 
 /*
@@ -348,6 +517,24 @@ static inline int priv_check_cred(const struct ucred *cred, int priv)
 	return EPERM;	/* port stub: deny privileged ops */
 }
 #define PRIV_VFS_RETAINSUGID	0
+#define PRIV_VFS_CHOWN		0
+#define PRIV_VFS_SETGID		0
+#define PRIV_VFS_STICKYFILE	0
+#define PRIV_VFS_SYSFLAGS	0
+
+/* BSD file mode helpers. */
+#ifndef ALLPERMS
+#define ALLPERMS	(S_ISUID | S_ISGID | S_ISVTX | 0777)
+#endif
+#ifndef S_ISTXT
+#define S_ISTXT		S_ISVTX
+#endif
+#ifndef EFTYPE
+#define EFTYPE		EINVAL
+#endif
+#ifndef NODEV
+#define NODEV		((dev_t)(-1))
+#endif
 
 /* BSD major(dev_t) / minor(dev_t) -- Linux has MAJOR/MINOR via <linux/kdev_t.h> */
 #include <linux/kdev_t.h>

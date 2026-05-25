@@ -38,10 +38,7 @@
 #include "hammer2.h"
 
 /* breadth-first search */
-typedef struct hammer2_chain_save {
-	TAILQ_ENTRY(hammer2_chain_save)	entry;
-	hammer2_chain_t	*chain;
-} hammer2_chain_save_t;
+/* hammer2_chain_save_t is now declared in hammer2.h so other TUs can use it. */
 
 TAILQ_HEAD(hammer2_chain_save_list, hammer2_chain_save);
 typedef struct hammer2_chain_save_list hammer2_chain_save_list_t;
