@@ -1,0 +1,241 @@
+/*
+ * hammer2_os.h - Linux OS compatibility shims for HAMMER2 port
+ *
+ * Provides BSD-style locking primitives (with refcount semantics) on top of
+ * Linux mutexes / rwsems / wait queues.
+ */
+
+#ifndef _HAMMER2_OS_H_
+#define _HAMMER2_OS_H_
+
+#include <linux/mutex.h>
+#include <linux/rwsem.h>
+#include <linux/wait.h>
+#include <linux/spinlock.h>
+#include <linux/atomic.h>
+#include <linux/sched.h>
+#include <linux/jiffies.h>
+#include <linux/delay.h>
+#include <linux/errno.h>
+
+/*
+ * Lock primitive typedefs.  These are referenced by hammer2.h and must be
+ * defined before any of the inline helpers below.
+ */
+struct hammer2_mtx_wrapper {
+	struct mutex	lock;
+	atomic_t	refs;
+};
+typedef struct hammer2_mtx_wrapper	hammer2_mtx_t;
+
+typedef struct rw_semaphore		hammer2_lk_t;
+typedef wait_queue_head_t		hammer2_lkc_t;
+typedef spinlock_t			hammer2_spin_t;
+
+/*
+ * Mutex shim with reference counting.  BSD lockmgr() distinguishes between
+ * recursive and non-recursive holds; Linux mutex_lock() does not, so we
+ * approximate by tracking an explicit refcount alongside the mutex.
+ */
+static inline void
+hammer2_mtx_init(hammer2_mtx_t *p, const char *s)
+{
+	mutex_init(&p->lock);
+	atomic_set(&p->refs, 0);
+}
+
+static inline void
+hammer2_mtx_init_recurse(hammer2_mtx_t *p, const char *s)
+{
+	mutex_init(&p->lock);
+	atomic_set(&p->refs, 0);
+}
+
+static inline void
+hammer2_mtx_ex(hammer2_mtx_t *p)
+{
+	mutex_lock(&p->lock);
+	atomic_inc(&p->refs);
+}
+
+static inline void
+hammer2_mtx_sh(hammer2_mtx_t *p)
+{
+	mutex_lock(&p->lock);
+	atomic_inc(&p->refs);
+}
+
+static inline void
+hammer2_mtx_unlock(hammer2_mtx_t *p)
+{
+	atomic_dec(&p->refs);
+	mutex_unlock(&p->lock);
+}
+
+static inline int
+hammer2_mtx_refs(hammer2_mtx_t *p)
+{
+	return atomic_read(&p->refs);
+}
+
+static inline void
+hammer2_mtx_destroy(hammer2_mtx_t *p)
+{
+	mutex_destroy(&p->lock);
+}
+
+/*
+ * BSD hammer2_mtx_sleep(channel, mtx, msg, timo) treats `channel` as an
+ * opaque cookie used by hammer2_mtx_wakeup(channel) to wake matching
+ * sleepers.  On Linux we lack a per-address wait queue, so accept a void*
+ * channel and just sleep for the requested timeout; spurious wakeups are
+ * tolerated by callers, which always re-check the wait condition.
+ */
+static inline int
+hammer2_mtx_sleep(void *c, hammer2_mtx_t *p, const char *s, int timo)
+{
+	int refs = atomic_read(&p->refs);
+
+	(void)c;
+	(void)s;
+
+	while (atomic_read(&p->refs) > 0) {
+		mutex_unlock(&p->lock);
+		atomic_dec(&p->refs);
+	}
+
+	schedule_timeout_uninterruptible(timo ? timo : 1);
+
+	mutex_lock(&p->lock);
+	atomic_set(&p->refs, refs);
+	return 0;
+}
+
+static inline void
+hammer2_mtx_wakeup(void *c)
+{
+	(void)c;
+	/* No-op: paired with the timeout-based hammer2_mtx_sleep above. */
+}
+
+static inline int
+hammer2_mtx_owned(hammer2_mtx_t *p)
+{
+	return mutex_is_locked(&p->lock);
+}
+
+static inline int
+hammer2_mtx_ex_try(hammer2_mtx_t *p)
+{
+	if (mutex_trylock(&p->lock)) {
+		atomic_inc(&p->refs);
+		return 0;
+	}
+	return 1;
+}
+
+static inline int
+hammer2_mtx_sh_try(hammer2_mtx_t *p)
+{
+	return hammer2_mtx_ex_try(p);
+}
+
+static inline int
+hammer2_mtx_upgrade_try(hammer2_mtx_t *p)
+{
+	/* Linux mutex has no concept of shared->exclusive upgrade. */
+	return 1;
+}
+
+static inline int
+hammer2_mtx_temp_release(hammer2_mtx_t *p)
+{
+	int x = atomic_read(&p->refs);
+
+	while (atomic_read(&p->refs) > 0) {
+		mutex_unlock(&p->lock);
+		atomic_dec(&p->refs);
+	}
+	return x;
+}
+
+static inline void
+hammer2_mtx_temp_restore(hammer2_mtx_t *p, int x)
+{
+	mutex_lock(&p->lock);
+	atomic_set(&p->refs, x);
+}
+
+/*
+ * Convenience aliases.  BSD code uses _lock/_shunlock; mtx_ex is the
+ * exclusive-lock primitive, and the wrapper's mtx_unlock releases both
+ * shared and exclusive holds.
+ */
+#define hammer2_mtx_lock(p)	hammer2_mtx_ex(p)
+#define hammer2_mtx_shunlock(p)	hammer2_mtx_unlock(p)
+
+/*
+ * Spinlock primitives.  BSD's spin_ex / spin_sh map to Linux spin_lock();
+ * Linux doesn't distinguish read/write on plain spinlocks.
+ */
+#define hammer2_spin_ex(s)	spin_lock(s)
+#define hammer2_spin_unex(s)	spin_unlock(s)
+#define hammer2_spin_sh(s)	spin_lock(s)
+#define hammer2_spin_unsh(s)	spin_unlock(s)
+
+/*
+ * rw_semaphore-based "lk" lock primitives.  hammer2_lk_t is a rw_semaphore.
+ */
+#define hammer2_lk_ex(l)	down_write(l)
+#define hammer2_lk_unlock(l)	up_write(l)
+#define hammer2_lk_assert_ex(l)	WARN_ON(!rwsem_is_locked(l))
+
+/*
+ * Diagnostic helper: BSD provides hammer2_mtx_assert_unlocked() to assert
+ * the lock isn't held by us.  Linux mutex_is_locked() doesn't distinguish
+ * "held by current task" from "held by someone else", so the strict BSD
+ * semantics aren't reproducible.  We approximate by simply warning if the
+ * mutex is currently locked at all.
+ */
+#define hammer2_mtx_assert_unlocked(p)	WARN_ON(mutex_is_locked(&(p)->lock))
+
+/*
+ * Condition-variable style sleep/wakeup.  hammer2_lkc_t is a
+ * wait_queue_head_t.  We release the associated lk while waiting and
+ * reacquire on wake.
+ */
+static inline int
+hammer2_lkc_sleep(hammer2_lkc_t *c, hammer2_lk_t *lk, const char *s, int timo)
+{
+	int ret = 0;
+
+	up_write(lk);
+	if (timo == 0) {
+		wait_event(*c, 0);
+	} else {
+		ret = wait_event_timeout(*c, 0, msecs_to_jiffies(timo));
+		ret = (ret == 0) ? -ETIMEDOUT : 0;
+	}
+	down_write(lk);
+	return ret;
+}
+
+static inline void
+hammer2_lkc_wakeup(hammer2_lkc_t *c)
+{
+	wake_up(c);
+}
+
+static inline void
+hammer2_lkc_init(hammer2_lkc_t *c, const char *s)
+{
+	init_waitqueue_head(c);
+}
+
+static inline void
+hammer2_lkc_destroy(hammer2_lkc_t *c)
+{
+	(void)c;
+}
+
+#endif /* !_HAMMER2_OS_H_ */
