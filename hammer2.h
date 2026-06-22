@@ -1352,6 +1352,7 @@ void hammer2_bioq_sync(hammer2_pfs_t *pmp);
 struct vop_strategy_args;
 int hammer2_strategy(struct vop_strategy_args *ap);
 int  hammer2_igetv(hammer2_inode_t *ip, int flags, void *vpp);
+struct inode *hammer2_iget(struct super_block *sb, hammer2_inode_t *ip);
 #define wakeup(c)	hammer2_mtx_wakeup((void *)(c))
 
 #endif /* !_HAMMER2_H_ */

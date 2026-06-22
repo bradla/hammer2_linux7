@@ -25,8 +25,15 @@ hammer2-y := \
 	hammer2_inode.o \
 	hammer2_vfsops.o \
 	hammer2_init.o \
-	hammer2_vnops.o
+	hammer2_vnops.o \
+	hammer2_linux_vfs.o
 	
+# REWRITE REQUIRED -- not just shimmable:
+#	hammer2_vnops.o    BSD VOP_* dispatch (27 distinct struct vop_*_args
+#	                    types) needs rewrite as Linux struct file_operations /
+#	                    inode_operations / address_space_operations members
+#	                    with completely different signatures.
+
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 

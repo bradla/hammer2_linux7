@@ -227,11 +227,38 @@ static inline void hstrfree(char *s)       { kfree(s); }
 /* TAILQ_EMPTY shim -- list_empty on the embedded list_head. */
 #define TAILQ_EMPTY(hp)		list_empty(&(hp)->head)
 
-/* BSD vfs_getopt / vfs_filteropt -- stubs that succeed without doing work. */
-static inline int vfs_getopt(void *opts, const char *name,
+/*
+ * BSD vfs_getopt -- on Linux the mount glue (hammer2_linux_vfs.c) builds a
+ * small option list in mp->mnt_optnew and points hammer2_mount() at it.  A
+ * NULL list degrades to "no options found" (ENOENT) so call sites still
+ * compile and behave for the BSD vfsops dispatch path that is never reached.
+ */
+struct h2_mount_opt {
+	const char	*name;
+	void		*value;
+	int		len;
+};
+struct h2_mount_optlist {
+	int			count;
+	struct h2_mount_opt	opts[8];
+};
+static inline int vfs_getopt(void *optsv, const char *name,
 			     void **buf, int *len)
 {
-	(void)opts; (void)name;
+	struct h2_mount_optlist *ol = optsv;
+	int i;
+
+	if (ol) {
+		for (i = 0; i < ol->count; ++i) {
+			if (strcmp(ol->opts[i].name, name) == 0) {
+				if (buf)
+					*buf = ol->opts[i].value;
+				if (len)
+					*len = ol->opts[i].len;
+				return 0;
+			}
+		}
+	}
 	if (buf) *buf = NULL;
 	if (len) *len = 0;
 	return ENOENT;

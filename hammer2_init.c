@@ -33,19 +33,10 @@ int hammer2_vop_panic(void *ap)
 	return -EIO;
 }
 
-static int __init hammer2_module_init(void)
-{
-	pr_info("hammer2: module loaded (VFS dispatch not yet wired up)\n");
-	return 0;
-}
-
-static void __exit hammer2_module_exit(void)
-{
-	pr_info("hammer2: module unloaded\n");
-}
-
-module_init(hammer2_module_init);
-module_exit(hammer2_module_exit);
+/*
+ * module_init()/module_exit() and register_filesystem() now live in
+ * hammer2_linux_vfs.c, which implements the real Linux VFS glue layer.
+ */
 
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_DESCRIPTION("DragonFlyBSD HAMMER2 filesystem port");

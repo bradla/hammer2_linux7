@@ -600,14 +600,24 @@ hammer2_inode_drop(hammer2_inode_t *ip)
  * now leave the function as a stub that returns -ENOSYS so callers fail
  * cleanly.
  */
+/* hammer2_iget() is implemented in hammer2_linux_vfs.c (iget5_locked wiring). */
 int
 hammer2_igetv(hammer2_inode_t *ip, int flags, void *vpp)
 {
-	(void)ip;
+	struct inode *inode;
+
 	(void)flags;
 	if (vpp)
 		*(void **)vpp = NULL;
-	return -ENOSYS;
+	if (ip == NULL || ip->pmp == NULL || ip->pmp->sb == NULL)
+		return -EINVAL;
+
+	inode = hammer2_iget(ip->pmp->sb, ip);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+	if (vpp)
+		*(struct inode **)vpp = inode;
+	return 0;
 }
 
 /*

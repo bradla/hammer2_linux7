@@ -43,12 +43,12 @@
 #include <linux/parser.h>
 #include <linux/blkdev.h>
 
-static int hammer2_unmount(struct mount *, int);
+int hammer2_unmount(struct mount *, int);
 static int hammer2_recovery(hammer2_dev_t *);
 static int hammer2_fixup_pfses(hammer2_dev_t *);
 static int hammer2_remount_impl(hammer2_dev_t *);
 static int hammer2_remount(hammer2_dev_t *, struct mount *);
-static int hammer2_statfs(struct mount *, struct h2statfs *);
+int hammer2_statfs(struct mount *, struct h2statfs *);
 static void hammer2_update_pmps(hammer2_dev_t *);
 static void hammer2_mount_helper(struct mount *, hammer2_pfs_t *);
 static void hammer2_unmount_helper(struct mount *, hammer2_pfs_t *,
@@ -542,7 +542,7 @@ again:
 /*
  * Mount or remount HAMMER2 fileystem from physical media.
  */
-static int
+int
 hammer2_mount(struct mount *mp)
 {
 	struct vfsoptlist *opts = mp->mnt_optnew;
@@ -1095,7 +1095,7 @@ hammer2_update_pmps(hammer2_dev_t *hmp)
 	hammer2_inode_unlock(spmp->iroot);
 }
 
-static int
+int
 hammer2_unmount(struct mount *mp, int mntflags)
 {
 	hammer2_pfs_t *pmp = MPTOPMP(mp);
@@ -2009,7 +2009,7 @@ hammer2_vget(struct mount *mp, ino_t ino, int flags, struct inode **vpp)
 	return (error);
 }
 
-static int
+int
 hammer2_root(struct mount *mp, int flags, struct inode **vpp)
 {
 	hammer2_pfs_t *pmp = MPTOPMP(mp);
@@ -2073,7 +2073,7 @@ hammer2_root(struct mount *mp, int flags, struct inode **vpp)
 	return (error);
 }
 
-static int
+int
 hammer2_statfs(struct mount *mp, struct h2statfs *sbp)
 {
 	hammer2_pfs_t *pmp = MPTOPMP(mp);
