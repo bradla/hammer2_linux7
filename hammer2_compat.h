@@ -117,9 +117,18 @@ static inline void *
 hammer2_kmalloc(size_t sz, void *tag, unsigned int flags)
 {
 	gfp_t gfp = (flags & ~M_ZERO) ? (gfp_t)(flags & ~M_ZERO) : GFP_KERNEL;
+	/*
+	 * Use kvmalloc(): several HAMMER2 structures (hammer2_dev with its
+	 * iohash[32768] + heur_dedup[262144] arrays ~= 7MB, hammer2_pfs with
+	 * inumhash[32768]) exceed Linux's ~4MB kmalloc limit, where DragonFly's
+	 * kmalloc handled any size.  kvmalloc falls back to vmalloc for large
+	 * allocations and behaves like kmalloc for small ones; kvfree() copes
+	 * with both.  (For GFP_ATOMIC kvmalloc only attempts kmalloc, which is
+	 * the desired behaviour.)
+	 */
 	if (flags & M_ZERO)
-		return kzalloc(sz, gfp);
-	return kmalloc(sz, gfp);
+		return kvzalloc(sz, gfp);
+	return kvmalloc(sz, gfp);
 }
 
 /*
@@ -145,8 +154,11 @@ hammer2_kfree(void *p, void *tag)
  * Map them onto Linux kmalloc/krealloc/kfree, dropping the unused tag.
  */
 #define hmalloc(sz, tag, fl)		hammer2_kmalloc((sz), (tag), (fl))
-/* DragonFly hfree() may be called as hfree(p, tag) or hfree(p, tag, size). */
-#define hfree(p, ...)			kfree((p))
+/*
+ * DragonFly hfree() may be called as hfree(p, tag) or hfree(p, tag, size).
+ * kvfree() handles both kmalloc- and vmalloc-backed pointers from hmalloc().
+ */
+#define hfree(p, ...)			kvfree((p))
 
 static inline void *
 hammer2_krealloc(void *p, size_t sz, void *tag, unsigned int flags)
@@ -205,12 +217,21 @@ static const int maxphys = (1 << 20);	/* 1 MiB */
 static inline unsigned long *hashinit(int elements, void *type,
 				      unsigned long *hashmask)
 {
-	int sz = roundup_pow_of_two(elements);
-	unsigned long *t = kzalloc(sz * sizeof(struct list_head), GFP_KERNEL);
+	int i, sz = roundup_pow_of_two(elements);
+	struct list_head *t = kzalloc(sz * sizeof(struct list_head), GFP_KERNEL);
+
+	/*
+	 * Each bucket is a list head and MUST be self-initialized -- a zeroed
+	 * list_head (next=prev=NULL) is not a valid empty list, and iterating
+	 * it (list_first_entry_or_null sees next != head) dereferences NULL.
+	 */
+	if (t)
+		for (i = 0; i < sz; ++i)
+			INIT_LIST_HEAD(&t[i]);
 	if (hashmask)
 		*hashmask = sz - 1;
 	(void)type;
-	return t;
+	return (unsigned long *)t;
 }
 static inline void hashdestroy(void *table, void *type, unsigned long hashmask)
 {
@@ -270,10 +291,13 @@ static inline int vfs_filteropt(void *opts, const char **legal)
 }
 
 /*
- * MPTOPMP(mp) -- BSD macro that fetches the FS-private hammer2_pfs from
- * a struct mount.  On Linux that's the super_block's s_fs_info.
+ * MPTOPMP(mp) -- BSD macro that fetches the FS-private hammer2_pfs from a
+ * struct mount.  Every caller in this port passes the BSD `struct mount`
+ * shim (NOT a super_block), and hammer2_mount_helper() stores the pmp in
+ * mp->mnt_data -- so read it from there.  (Casting to super_block and reading
+ * s_fs_info read past the small struct mount shim and returned garbage/NULL.)
  */
-#define MPTOPMP(sb)	((hammer2_pfs_t *)((struct super_block *)(sb))->s_fs_info)
+#define MPTOPMP(mp)	((hammer2_pfs_t *)((struct mount *)(mp))->mnt_data)
 
 /*
  * BSD struct mount stub.  HAMMER2's vfsops reads a handful of fields.
@@ -839,13 +863,16 @@ uma_zfree(uma_zone_t z, void *p)
  * Additional compatibility macros that may be needed
  */
 
-/* 
- * Atomic operations - Linux already has these in <linux/atomic.h>
- * These are just for reference if needed elsewhere
+/*
+ * NOTE: Do NOT redefine atomic_add_int / atomic_set_int / atomic_cmpset_int
+ * here.  The correct BSD-semantics versions are defined above:
+ *   atomic_set_int(p,v)   == atomic_or  (set the bits in v)
+ *   atomic_clear_int(p,v) == atomic_andnot
+ *   atomic_cmpset_int     returns a success boolean
+ * The earlier (buggy) redefinitions used atomic_set() -- which OVERWRITES the
+ * whole word -- so e.g. atomic_set_int(&chain->flags, BIT) clobbered every
+ * other flag bit, corrupting the CHAIN_IOINPROG interlock and much more.
  */
-#define atomic_add_int(p, v)    atomic_add(v, (atomic_t *)(p))
-#define atomic_set_int(p, v)    atomic_set((atomic_t *)(p), v)
-#define atomic_cmpset_int(p, o, n) atomic_cmpxchg((atomic_t *)(p), o, n)
 
 /*
  * Time conversion helpers (if needed)

@@ -143,8 +143,17 @@ hammer2_mtx_sh_try(hammer2_mtx_t *p)
 static inline int
 hammer2_mtx_upgrade_try(hammer2_mtx_t *p)
 {
-	/* Linux mutex has no concept of shared->exclusive upgrade. */
-	return 1;
+	/*
+	 * In this shim hammer2_mtx_sh() and hammer2_mtx_ex() both take the
+	 * underlying mutex exclusively, so whenever the lock is held it is
+	 * already "exclusive".  An upgrade therefore always succeeds (0).
+	 *
+	 * Returning failure (1) here caused hammer2_chain_unlock()'s
+	 * lockcnt 1->0 path to live-loop forever ("h2race2"), since that path
+	 * only completes when the upgrade succeeds.
+	 */
+	(void)p;
+	return 0;
 }
 
 static inline int

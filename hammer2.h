@@ -73,8 +73,19 @@
 #define TAILQ_INSERT_TAIL(hp, elm, field) list_add_tail(&(elm)->field, &(hp)->head)
 #define TAILQ_INSERT_HEAD(hp, elm, field) list_add(&(elm)->field, &(hp)->head)
 #define TAILQ_REMOVE(hp, elm, field) list_del(&(elm)->field)
+/*
+ * BSD TAILQ_FOREACH terminates with (var) == NULL when the list is empty or
+ * exhausted, and a LOT of HAMMER2 code relies on that (e.g. iterate, then
+ * `if (var == NULL)` means "not found").  Linux's list_for_each_entry leaves
+ * the iterator pointing at the list head (container_of(head,...)) -- a bogus
+ * non-NULL pointer -- which makes those checks fail and dereference garbage.
+ * So implement BSD NULL-terminating semantics explicitly.
+ */
 #define TAILQ_FOREACH(var, hp, field) \
-    list_for_each_entry(var, &(hp)->head, field)
+    for ((var) = list_first_entry_or_null(&(hp)->head, typeof(*(var)), field); \
+         (var) != NULL; \
+         (var) = list_is_last(&(var)->field, &(hp)->head) ? NULL \
+                 : list_next_entry((var), field))
 /*
  * BSD's TAILQ_FIRST(&head) returns an element pointer; since our shim TAILQ
  * head encodes no element type, callers must spell out the type by using
@@ -91,8 +102,12 @@
 #define LIST_INIT(hp) INIT_LIST_HEAD(&(hp)->head)
 #define LIST_INSERT_HEAD(hp, elm, field) list_add(&(elm)->field, &(hp)->head)
 #define LIST_REMOVE(elm, field) list_del(&(elm)->field)
+/* NULL-terminating like BSD (see TAILQ_FOREACH note above). */
 #define LIST_FOREACH(var, hp, field) \
-    list_for_each_entry(var, &(hp)->head, field)
+    for ((var) = list_first_entry_or_null(&(hp)->head, typeof(*(var)), field); \
+         (var) != NULL; \
+         (var) = list_is_last(&(var)->field, &(hp)->head) ? NULL \
+                 : list_next_entry((var), field))
 
 /*
  * Lock primitive typedefs (hammer2_mtx_t, hammer2_lk_t, hammer2_lkc_t,
@@ -572,7 +587,8 @@ struct hammer2_io {
     hammer2_mtx_t        lock;
     hammer2_dev_t        *hmp;
     struct block_device  *bdev;
-    struct buffer_head   *bh;
+    struct buffer_head   *bh;       /* unused on Linux; kept for ABI parity */
+    char                 *data;     /* private 64K buffer (PAGE_SIZE-chunked I/O) */
     uint32_t             refs;
     u64                  dbase;      /* offset of devvp within volumes */
     u64                  pbase;
@@ -1208,8 +1224,18 @@ extern int hammer2_always_compress;
 
 /* CRC32 functions - use Linux kernel's CRC32 */
 #include <linux/crc32.h>
-#define hammer2_icrc32(buf, size) crc32(~0U, buf, size)
-#define hammer2_icrc32c(buf, size, crc) crc32(crc, buf, size)
+/*
+ * HAMMER2 uses the iSCSI CRC (CRC32C / Castagnoli), NOT the Ethernet CRC32.
+ * DragonFly:
+ *   iscsi_crc32(buf, size)        = ~calculate_crc32c(-1, buf, size)
+ *   iscsi_crc32_ext(buf,size,ocrc)= ~calculate_crc32c(~ocrc, buf, size)
+ * Linux crc32c() is the raw Castagnoli update (no pre/post inversion), so the
+ * inversions are applied here.  Using crc32() (Ethernet poly) here makes every
+ * on-disk CRC mismatch.
+ */
+#include <linux/crc32.h>
+#define hammer2_icrc32(buf, size)	(~crc32c(~0U, (buf), (size)))
+#define hammer2_icrc32c(buf, size, crc)	(~crc32c(~(uint32_t)(crc), (buf), (size)))
 
 /* Function declarations */
 void *hammer2_xop_alloc(hammer2_inode_t *, int);
@@ -1351,6 +1377,9 @@ void hammer2_bulkfree_uninit(hammer2_dev_t *hmp);
 void hammer2_bioq_sync(hammer2_pfs_t *pmp);
 struct vop_strategy_args;
 int hammer2_strategy(struct vop_strategy_args *ap);
+/* PAGE_SIZE-chunked device read of a 64K-aligned region (hammer2_io.c). */
+int hammer2_dev_bread(struct block_device *bdev, loff_t byteoff, void *buf,
+    int bytes);
 int  hammer2_igetv(hammer2_inode_t *ip, int flags, void *vpp);
 struct inode *hammer2_iget(struct super_block *sb, hammer2_inode_t *ip);
 #define wakeup(c)	hammer2_mtx_wakeup((void *)(c))

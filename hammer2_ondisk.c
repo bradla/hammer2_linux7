@@ -74,6 +74,15 @@ hammer2_open_devvp(void *mp, const hammer2_devvp_list_t *devvpl)
 		e->bdev_file = bdev_file;
 		e->bdev = file_bdev(bdev_file);
 		e->open = 1;
+
+		/*
+		 * No set_blocksize() needed: HAMMER2's 64K device I/O is done
+		 * as PAGE_SIZE chunks via hammer2_dev_bread()/bwrite(), and
+		 * __bread()/__getblk() with an explicit PAGE_SIZE return the
+		 * correct data regardless of the device's default block size.
+		 * (set_blocksize() to 64K -- or even 4K -- is rejected with
+		 * -EINVAL on some devices, so we don't rely on it.)
+		 */
 	}
 
 	return error;
@@ -432,14 +441,21 @@ hammer2_read_volume_header(struct block_device *bdev, const char *path,
 {
 	hammer2_volume_data_t *vd;
 	hammer2_crc32_t crc0, crc1;
-	struct buffer_head *bp;
+	char *vbuf;
 	loff_t mediasize;
 	off_t blkoff;
-	sector_t blkno;
 	int i, zone = -1;
 
 	KASSERTMSG(bdev != NULL, "NULL bdev");
 	mediasize = bdev_nr_bytes(bdev);
+
+	/*
+	 * Read each 64K volume header via PAGE_SIZE-chunked transfers (see
+	 * hammer2_dev_bread); a single 64K buffer_head is not available.
+	 */
+	vbuf = kvmalloc(HAMMER2_VOLUME_BYTES, GFP_KERNEL);
+	if (!vbuf)
+		return (-ENOMEM);
 
 	/*
 	 * Up to 4 volume header copies; iterate until we find the most
@@ -450,56 +466,49 @@ hammer2_read_volume_header(struct block_device *bdev, const char *path,
 		if (blkoff >= mediasize)
 			continue;
 
-		blkno = blkoff / HAMMER2_VOLUME_BYTES;
-		bp = __bread(bdev, blkno, HAMMER2_VOLUME_BYTES);
-		if (!bp)
+		if (hammer2_dev_bread(bdev, blkoff, vbuf, HAMMER2_VOLUME_BYTES))
 			continue;
 
-		vd = (struct hammer2_volume_data *)bp->b_data;
+		vd = (struct hammer2_volume_data *)vbuf;
 		/* Verify volume header magic. */
 		if ((vd->magic != HAMMER2_VOLUME_ID_HBO) &&
 		    (vd->magic != HAMMER2_VOLUME_ID_ABO)) {
 			hprintf("%s #%d: bad magic\n", path, i);
-			brelse(bp);
 			continue;
 		}
 		if (vd->magic == HAMMER2_VOLUME_ID_ABO) {
 			/* XXX: Reversed-endianness filesystem. */
 			hprintf("%s #%d: reverse-endian filesystem detected\n",
 			    path, i);
-			brelse(bp);
 			continue;
 		}
 
 		/* Verify volume header CRC's. */
 		crc0 = vd->icrc_sects[HAMMER2_VOL_ICRC_SECT0];
-		crc1 = hammer2_icrc32(bp->b_data + HAMMER2_VOLUME_ICRC0_OFF,
+		crc1 = hammer2_icrc32(vbuf + HAMMER2_VOLUME_ICRC0_OFF,
 		    HAMMER2_VOLUME_ICRC0_SIZE);
 		if (crc0 != crc1) {
 			hprintf("%s #%d: volume header crc mismatch sect0 "
 			    "%08x/%08x\n",
 			    path, i, crc0, crc1);
-			brelse(bp);
 			continue;
 		}
 		crc0 = vd->icrc_sects[HAMMER2_VOL_ICRC_SECT1];
-		crc1 = hammer2_icrc32(bp->b_data + HAMMER2_VOLUME_ICRC1_OFF,
+		crc1 = hammer2_icrc32(vbuf + HAMMER2_VOLUME_ICRC1_OFF,
 		    HAMMER2_VOLUME_ICRC1_SIZE);
 		if (crc0 != crc1) {
 			hprintf("%s #%d: volume header crc mismatch sect1 "
 			    "%08x/%08x\n",
 			    path, i, crc0, crc1);
-			brelse(bp);
 			continue;
 		}
 		crc0 = vd->icrc_volheader;
-		crc1 = hammer2_icrc32(bp->b_data + HAMMER2_VOLUME_ICRCVH_OFF,
+		crc1 = hammer2_icrc32(vbuf + HAMMER2_VOLUME_ICRCVH_OFF,
 		    HAMMER2_VOLUME_ICRCVH_SIZE);
 		if (crc0 != crc1) {
 			hprintf("%s #%d: volume header crc mismatch vh "
 			    "%08x/%08x\n",
 			    path, i, crc0, crc1);
-			brelse(bp);
 			continue;
 		}
 
@@ -507,8 +516,9 @@ hammer2_read_volume_header(struct block_device *bdev, const char *path,
 			*voldata = *vd;
 			zone = i;
 		}
-		brelse(bp);
 	}
+
+	kvfree(vbuf);
 
 	if (zone == -1) {
 		hprintf("%s has no valid volume headers\n", path);

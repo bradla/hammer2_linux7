@@ -35,6 +35,16 @@
 #include <linux/version.h>
 #include <linux/uaccess.h>
 
+/*
+ * Port version string.  Bump HAMMER2_PORT_VERSION on each change so the
+ * loaded build is identifiable via `dmesg` (printed at module load) and
+ * `modinfo hammer2.ko | grep version`.  The build date/time is appended
+ * automatically so two builds of the same version number are still
+ * distinguishable.
+ */
+#define HAMMER2_PORT_VERSION	"0.13"
+#define HAMMER2_PORT_BUILD	HAMMER2_PORT_VERSION " built " __DATE__ " " __TIME__
+
 /* BSD-shaped vfsops entry points (un-static'd in hammer2_vfsops.c). */
 int hammer2_mount(struct mount *mp);
 int hammer2_unmount(struct mount *mp, int mntflags);
@@ -42,6 +52,9 @@ int hammer2_root(struct mount *mp, int flags, struct inode **vpp);
 int hammer2_statfs(struct mount *mp, struct h2statfs *sbp);
 int hammer2_sync(struct mount *mp, int waitfor);
 hammer2_tid_t hammer2_trans_newinum(hammer2_pfs_t *pmp);
+struct vfsconf;
+int hammer2_init(struct vfsconf *vfsp);
+int hammer2_uninit(struct vfsconf *vfsp);
 
 static const struct super_operations hammer2_super_ops;
 static const struct inode_operations hammer2_dir_iops;
@@ -1300,7 +1313,13 @@ hammer2_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	error = hammer2_mount(mp);
 	if (error) {
-		error = -error;		/* BSD positive errno -> Linux negative */
+		/*
+		 * hammer2_mount() returns positive BSD errnos from its own
+		 * logic but can also propagate negative Linux errnos from
+		 * helpers like hammer2_open_devvp().  Normalize to negative.
+		 */
+		if (error > 0)
+			error = -error;
 		goto fail_free;
 	}
 
@@ -1326,7 +1345,8 @@ hammer2_fill_super(struct super_block *sb, struct fs_context *fc)
 	/* Root inode (also initializes pmp->inode_tid and root meta). */
 	error = hammer2_root(mp, 0, &root_inode);
 	if (error) {
-		error = -error;
+		if (error > 0)
+			error = -error;
 		goto fail_unmount;
 	}
 
@@ -1385,19 +1405,29 @@ static struct file_system_type hammer2_fs_type = {
 };
 MODULE_ALIAS_FS("hammer2");
 
-extern void hammer2_init_globals(void);
-
 static int __init
 hammer2_module_init(void)
 {
 	int error;
 
+	/*
+	 * Run the global initializer that the BSD vfsops table invoked via
+	 * .vfs_init: it creates the UMA zones and initializes the global
+	 * mount/pfs lists and locks.  hammer2_mount() walks hammer2_mntlist,
+	 * so this MUST happen before register_filesystem().
+	 */
+	error = hammer2_init(NULL);
+	if (error)
+		return error;
+
 	error = register_filesystem(&hammer2_fs_type);
 	if (error) {
 		pr_err("hammer2: register_filesystem failed: %d\n", error);
+		hammer2_uninit(NULL);
 		return error;
 	}
-	pr_info("hammer2: filesystem registered\n");
+	pr_info("hammer2: filesystem registered, version %s\n",
+	    HAMMER2_PORT_BUILD);
 	return 0;
 }
 
@@ -1406,8 +1436,15 @@ hammer2_module_exit(void)
 {
 	unregister_filesystem(&hammer2_fs_type);
 	rcu_barrier();
+	hammer2_uninit(NULL);
 	pr_info("hammer2: filesystem unregistered\n");
 }
 
 module_init(hammer2_module_init);
 module_exit(hammer2_module_exit);
+
+/*
+ * Note: the kernel's 1-arg MODULE_VERSION() is shadowed by a 2-arg BSD shim
+ * in hammer2_compat.h, so emit the modinfo "version" field directly.
+ */
+MODULE_INFO(version, HAMMER2_PORT_BUILD);

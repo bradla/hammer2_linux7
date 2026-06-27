@@ -161,7 +161,7 @@ hammer2_assert_clean(void)
 	return (error);
 }
 
-static int
+int
 hammer2_init(struct vfsconf *vfsp)
 {
 	long hammer2_limit_dirty_chains; /* originally sysctl */
@@ -209,7 +209,7 @@ hammer2_init(struct vfsconf *vfsp)
 	return (0);
 }
 
-static int
+int
 hammer2_uninit(struct vfsconf *vfsp)
 {
 	hammer2_lk_destroy(&hammer2_mntlk);
@@ -648,6 +648,21 @@ hammer2_mount(struct mount *mp)
 	}
 
 	/*
+	 * Port note: DragonFly's hammer2_init_devvp() opened the device
+	 * vnodes; this Linux port split opening into hammer2_open_devvp().
+	 * The device-already-mounted scan below compares e->bdev, so the
+	 * devices must be opened *before* that scan -- not deferred to the
+	 * hmp==NULL branch as the original port did (which left e->bdev NULL
+	 * and tripped KKASSERT(e->bdev)).
+	 */
+	error = hammer2_open_devvp(mp, &devvpl);
+	if (error) {
+		hammer2_close_devvp(&devvpl);
+		hammer2_cleanup_devvp(&devvpl);
+		return (error);
+	}
+
+	/*
 	 * Determine if the device has already been mounted.  After this
 	 * check hmp will be non-NULL if we are doing the second or more
 	 * HAMMER2 mounts from the same device.
@@ -719,15 +734,8 @@ next_hmp:
 	 * HAMMER2 device mount (hmp).
 	 */
 	if (hmp == NULL) {
-		/* Now open the device(s). */
+		/* Device(s) already opened above, before the mntlist scan. */
 		KKASSERT(!TAILQ_EMPTY(&devvpl));
-		error = hammer2_open_devvp(mp, &devvpl);
-		if (error) {
-			hammer2_close_devvp(&devvpl);
-			hammer2_cleanup_devvp(&devvpl);
-			hammer2_lk_unlock(&hammer2_mntlk);
-			return (error);
-		}
 
 		/* Construct volumes and link with device vnodes. */
 		hmp = hmalloc(sizeof(*hmp), M_HAMMER2, M_WAITOK | M_ZERO);

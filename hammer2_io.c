@@ -155,22 +155,77 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_off_t data_off, uint8_t btype,
 	return (dio);
 }
 
+/*
+ * Transfer a PAGE_SIZE-aligned, PAGE_SIZE-multiple region between the block
+ * device and a private buffer using one buffer_head per page.  This avoids
+ * relying on buffer_heads larger than PAGE_SIZE (which set_blocksize() will
+ * not grant for HAMMER2's 64K block size on most devices).
+ *
+ * byteoff is the device-relative byte offset; the block number handed to
+ * __bread()/__getblk() is therefore in PAGE_SIZE units.
+ */
+int
+hammer2_dev_bread(struct block_device *bdev, loff_t byteoff, void *buf,
+    int bytes)
+{
+	struct buffer_head *bh;
+	sector_t blk = (sector_t)(byteoff >> PAGE_SHIFT);
+	int i, n = bytes >> PAGE_SHIFT;
+
+	for (i = 0; i < n; ++i) {
+		bh = __bread(bdev, blk + i, PAGE_SIZE);
+		if (!bh)
+			return (-EIO);
+		memcpy((char *)buf + ((size_t)i << PAGE_SHIFT), bh->b_data,
+		    PAGE_SIZE);
+		brelse(bh);
+	}
+	return (0);
+}
+
+static int
+hammer2_dev_bwrite(struct block_device *bdev, loff_t byteoff, const void *buf,
+    int bytes, int sync)
+{
+	struct buffer_head *bh;
+	sector_t blk = (sector_t)(byteoff >> PAGE_SHIFT);
+	int i, n = bytes >> PAGE_SHIFT;
+	int error = 0;
+
+	for (i = 0; i < n; ++i) {
+		bh = __getblk(bdev, blk + i, PAGE_SIZE);
+		if (!bh) {
+			error = -EIO;
+			break;
+		}
+		lock_buffer(bh);
+		memcpy(bh->b_data, (const char *)buf + ((size_t)i << PAGE_SHIFT),
+		    PAGE_SIZE);
+		set_buffer_uptodate(bh);
+		mark_buffer_dirty(bh);
+		unlock_buffer(bh);
+		if (sync)
+			sync_dirty_buffer(bh);
+		brelse(bh);
+	}
+	return (error);
+}
+
 static int
 hammer2_bread(hammer2_dev_t *hmp, hammer2_io_t *dio, daddr_t lblkno, int hce)
 {
-	hammer2_off_t peof;
 	int error;
 
-	/*
-	 * Linux readahead is implicit via the page cache; both the cluster
-	 * and single-block read paths reduce to __bread() against the
-	 * underlying block_device.  We compute a 4K-aligned block number
-	 * since Linux buffer_heads are addressed in 'size' units.
-	 */
-	(void)peof;
+	(void)lblkno;
 	(void)hce;
-	dio->bh = __bread(dio->bdev, lblkno, dio->psize);
-	error = dio->bh ? 0 : -EIO;
+
+	if (dio->data == NULL) {
+		dio->data = kvmalloc(dio->psize, GFP_KERNEL);
+		if (dio->data == NULL)
+			return (-ENOMEM);
+	}
+	error = hammer2_dev_bread(dio->bdev, dio->pbase - dio->dbase, dio->data,
+	    dio->psize);
 	hammer2_inc_iostat(&hmp->iostat_read, dio->btype, dio->psize);
 
 	return (error);
@@ -185,7 +240,6 @@ hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
     int op)
 {
 	hammer2_io_t *dio;
-	daddr_t lblkno;
 	int error, hce;
 
 	KKASSERT((1 << (int)(lbase & HAMMER2_OFF_MASK_RADIX)) == lsize);
@@ -220,33 +274,39 @@ hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
 	}
 
 	/* GOOD is not set. */
-	KKASSERT(dio->bh == NULL);
+	KKASSERT(dio->data == NULL);
 	if (btype == HAMMER2_BREF_TYPE_DATA)
 		hce = hammer2_cluster_data_read;
 	else
 		hce = hammer2_cluster_meta_read;
 
 	error = 0;
-	lblkno = (dio->pbase - dio->dbase) / DEV_BSIZE;
 
 	if (dio->pbase == (lbase & ~HAMMER2_OFF_MASK_RADIX) &&
 	    dio->psize == lsize) {
 		switch (op) {
 		case HAMMER2_DOP_NEW:
 		case HAMMER2_DOP_NEWNZ:
-			dio->bh = __getblk(dio->bdev, lblkno, dio->psize);
-			if (op == HAMMER2_DOP_NEW && dio->bh)
-				bzero(dio->bh->b_data, dio->psize);
+			/*
+			 * Fresh allocation; no read-before-write required.
+			 * Allocate the private buffer (zeroed for DOP_NEW).
+			 */
+			dio->data = kvmalloc(dio->psize, GFP_KERNEL);
+			if (dio->data == NULL) {
+				error = -ENOMEM;
+				break;
+			}
+			if (op == HAMMER2_DOP_NEW)
+				bzero(dio->data, dio->psize);
 			dio->refs |= HAMMER2_DIO_DIRTY;
 			break;
 		default:
-			error = hammer2_bread(hmp, dio, lblkno, hce);
+			error = hammer2_bread(hmp, dio, 0, hce);
 			break;
 		}
 	} else {
-		error = hammer2_bread(hmp, dio, lblkno, hce);
-		if (dio->bh) {
-			KKASSERT(error == 0);
+		error = hammer2_bread(hmp, dio, 0, hce);
+		if (dio->data && error == 0) {
 			switch (op) {
 			case HAMMER2_DOP_NEW:
 				bzero(hammer2_io_data(dio, lbase), lsize);
@@ -259,7 +319,6 @@ hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
 			}
 		}
 	}
-	KKASSERT(error == 0 || dio->bh == NULL);
 
 	/* BUF_KERNPROC is a no-op on Linux; buffer ownership is per-task. */
 	dio->error = error;
@@ -314,32 +373,30 @@ hammer2_io_putblk(hammer2_io_t **diop)
 
 	/* Lastdrop (1->0 transition) case. */
 	hmp = dio->hmp;
-	bp = dio->bh;
+	bp = dio->bh;		/* always NULL on Linux */
 	dio->bh = NULL;
 
 	/*
-	 * Write out and dispose of buffer.  BSD's b[a]write / bdwrite /
-	 * cluster_write_vn variants reduce on Linux to mark_buffer_dirty()
-	 * plus the kernel's writeback machinery (or sync_dirty_buffer when
-	 * FLUSH is requested).  brelse() / bqrelse() / bforget() all map to
-	 * brelse() on Linux.
+	 * Write out and dispose of the private buffer.  A dirty buffer is
+	 * flushed back to the device as PAGE_SIZE chunks; FLUSH requests a
+	 * synchronous write, otherwise we let the kernel's writeback
+	 * machinery handle the dirtied device buffers.
 	 */
 	(void)peof;
 	(void)hce;
-	if ((orefs & HAMMER2_DIO_GOOD) && bp) {
+	(void)bp;
+	if ((orefs & HAMMER2_DIO_GOOD) && dio->data) {
 		if (orefs & HAMMER2_DIO_DIRTY) {
-			if (dio->refs & HAMMER2_DIO_FLUSH) {
-				mark_buffer_dirty(bp);
-				sync_dirty_buffer(bp);
-			} else {
-				mark_buffer_dirty(bp);
-			}
+			hammer2_dev_bwrite(dio->bdev, dio->pbase - dio->dbase,
+			    dio->data, dio->psize,
+			    (dio->refs & HAMMER2_DIO_FLUSH) ? 1 : 0);
 			hammer2_inc_iostat(&hmp->iostat_write, dio->btype,
 			    dio->psize);
 		}
-		brelse(bp);
-	} else if (bp) {
-		brelse(bp);
+	}
+	if (dio->data) {
+		kvfree(dio->data);
+		dio->data = NULL;
 	}
 
 	/* Update iofree_count before disposing of the dio. */
@@ -367,18 +424,15 @@ hammer2_io_putblk(hammer2_io_t **diop)
 char *
 hammer2_io_data(hammer2_io_t *dio, hammer2_off_t lbase)
 {
-	struct buffer_head *bp;
 	int off;
 
-	bp = dio->bh;
-	KASSERTMSG(bp != NULL, "NULL dio buf");
+	KASSERTMSG(dio->data != NULL, "NULL dio buf");
 
 	/*
 	 * Port note: BSD's bp->b_offset is the byte offset of the buffer
-	 * within its underlying device.  Linux buffer_heads don't carry
-	 * that field; we already know the buffer's device-relative base
-	 * via dio->pbase, so substitute (pbase - dbase) for b_offset and
-	 * dio->psize for b_bufsize.
+	 * within its underlying device.  Our private buffer covers the whole
+	 * dio->psize region starting at (pbase - dbase), so compute the
+	 * in-buffer offset from there.
 	 */
 	lbase -= dio->dbase;
 	off = (lbase & ~HAMMER2_OFF_MASK_RADIX) -
@@ -388,7 +442,7 @@ hammer2_io_data(hammer2_io_t *dio, hammer2_off_t lbase)
 	KASSERTMSG(off < dio->psize, "bad offset not 0x%x < 0x%x",
 	    off, dio->psize);
 
-	return (bp->b_data + off);
+	return (dio->data + off);
 }
 
 int
@@ -605,6 +659,10 @@ hammer2_io_hash_cleanup(hammer2_dev_t *hmp, int dio_limit)
 		if (dio->refs & HAMMER2_DIO_DIRTY)
 			hprintf("dirty buffer %016llx/%d\n",
 			    (long long)dio->pbase, dio->psize);
+		if (dio->data) {
+			kvfree(dio->data);
+			dio->data = NULL;
+		}
 		hammer2_mtx_destroy(&dio->lock);
 		hfree(dio, M_HAMMER2, sizeof(*dio));
 	}
@@ -632,6 +690,10 @@ hammer2_io_hash_cleanup_all(hammer2_dev_t *hmp)
 			if (dio->refs & HAMMER2_DIO_DIRTY)
 				hprintf("dirty buffer %016llx/%d\n",
 				    (long long)dio->pbase, dio->psize);
+			if (dio->data) {
+				kvfree(dio->data);
+				dio->data = NULL;
+			}
 			hammer2_mtx_destroy(&dio->lock);
 			hfree(dio, M_HAMMER2, sizeof(*dio));
 			atomic_add_int(&hammer2_count_dio_allocated, -1);
