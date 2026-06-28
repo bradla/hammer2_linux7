@@ -3899,22 +3899,6 @@ hammer2_chain_indkey_freemap(hammer2_chain_t *parent, hammer2_key_t *keyp,
 	 * Return the keybits for a higher-level FREEMAP_NODE covering
 	 * this node.
 	 */
-	if (keybits < HAMMER2_FREEMAP_LEVEL0_RADIX ||
-	    keybits > HAMMER2_FREEMAP_LEVEL5_RADIX) {
-		hprintf("indkey_freemap DIAG: parent type=%d bytes=%u "
-		    "flags=%08x INITIAL=%d count=%d base=%p keybits=%d "
-		    "key=%016llx\n",
-		    parent->bref.type, parent->bytes, parent->flags,
-		    !!(parent->flags & HAMMER2_CHAIN_INITIAL), count, base,
-		    keybits, (long long)*keyp);
-		hprintf("  DIAG parent=%px is_fchain=%d is_vchain=%d "
-		    "parent->data=%px expect_fdata=%px data_off=%016llx\n",
-		    parent, parent == &parent->hmp->fchain,
-		    parent == &parent->hmp->vchain, parent->data,
-		    &parent->hmp->voldata.freemap_blockset,
-		    (long long)parent->bref.data_off);
-	}
-
 	switch (keybits) {
 	case HAMMER2_FREEMAP_LEVEL0_RADIX:
 		keybits = HAMMER2_FREEMAP_LEVEL1_RADIX;
@@ -4587,18 +4571,6 @@ hammer2_base_insert(hammer2_chain_t *parent, hammer2_blockref_t *base,
 	 * XXX see caller, flush code not yet sophisticated enough to prevent
 	 *     re-flushed in some cases.
 	 */
-	if (elm->type == HAMMER2_BREF_TYPE_INODE) {
-		int selfref = ((elm->data_off ^ parent->bref.data_off) &
-		    ~HAMMER2_OFF_MASK_RADIX) == 0;
-		hprintf("BASE_INSERT inode elm[off=%016llx key=%016llx "
-		    "xxh=%016llx] -> parent[%px type=%d off=%016llx]%s\n",
-		    (long long)elm->data_off, (long long)elm->key,
-		    (long long)elm->check.xxhash64.value,
-		    parent, parent->bref.type,
-		    (long long)parent->bref.data_off,
-		    selfref ? "  <<< SELFREF same-block" : "");
-	}
-
 	key_next = 0; /* max range */
 	i = hammer2_base_find(parent, base, count, &key_next, elm->key);
 
@@ -4740,21 +4712,6 @@ hammer2_chain_setcheck(hammer2_chain_t *chain, void *bdata)
 	case HAMMER2_CHECK_XXHASH64:
 		chain->bref.check.xxhash64.value =
 		    XXH64(bdata, chain->bytes, XXH_HAMMER2_SEED);
-		if (chain->bref.type == HAMMER2_BREF_TYPE_INODE) {
-			const unsigned char *d = bdata;
-
-			hprintf("SETCHECK inode chain=%px off=%016llx key=%016llx "
-			    "bytes=%u xxh=%016llx bdata=%px chain->data=%px "
-			    "data[0..15]=%02x%02x%02x%02x %02x%02x%02x%02x "
-			    "%02x%02x%02x%02x %02x%02x%02x%02x\n",
-			    chain, (long long)chain->bref.data_off,
-			    (long long)chain->bref.key, chain->bytes,
-			    (long long)chain->bref.check.xxhash64.value,
-			    bdata, chain->data,
-			    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
-			    d[8], d[9], d[10], d[11], d[12], d[13], d[14],
-			    d[15]);
-		}
 		break;
 	case HAMMER2_CHECK_SHA192:
 		{
@@ -4833,8 +4790,6 @@ hammer2_chain_testcheck(const hammer2_chain_t *chain, void *bdata)
 	}
 
 	if (r == 0 && count < 1000) {
-		const unsigned char *d = bdata;
-
 		hprintf("failed: chain %s %016llx %016llx/%d meth %02x "
 		    "mir %016llx mod %016llx flags %08x\n",
 		    hammer2_breftype_to_str(chain->bref.type),
@@ -4842,26 +4797,6 @@ hammer2_chain_testcheck(const hammer2_chain_t *chain, void *bdata)
 		    chain->bref.keybits, chain->bref.methods,
 		    (long long)chain->bref.mirror_tid,
 		    (long long)chain->bref.modify_tid, chain->flags);
-		/* DIAG: dump bytes, stored vs computed check, and data preview. */
-		if (HAMMER2_DEC_CHECK(chain->bref.methods) ==
-		    HAMMER2_CHECK_XXHASH64) {
-			hprintf("  DIAG bytes=%u stored=%016llx "
-			    "computed=%016llx\n",
-			    chain->bytes,
-			    (long long)chain->bref.check.xxhash64.value,
-			    (long long)XXH64(bdata, chain->bytes,
-			    XXH_HAMMER2_SEED));
-			hprintf("  DIAG @1024(=%u)=%016llx data[0..15]= "
-			    "%02x%02x%02x%02x %02x%02x%02x%02x "
-			    "%02x%02x%02x%02x %02x%02x%02x%02x\n",
-			    1024,
-			    (long long)XXH64(bdata,
-			    chain->bytes > 1024 ? 1024 : chain->bytes,
-			    XXH_HAMMER2_SEED),
-			    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
-			    d[8], d[9], d[10], d[11], d[12], d[13], d[14],
-			    d[15]);
-		}
 		count++;
 		if (count >= 1000)
 			hprintf("gave up\n");

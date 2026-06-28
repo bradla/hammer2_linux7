@@ -240,11 +240,6 @@ hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes)
 	hammer2_chain_unlock(parent);
 	hammer2_chain_drop(parent);
 
-	hprintf("FREEMAP_ALLOC chain=%px type=%d bytes=%zu bpref=%016llx "
-	    "-> data_off=%016llx error=%d\n",
-	    chain, bref->type, bytes, (long long)iter.bpref,
-	    (long long)bref->data_off, error);
-
 	return (error);
 }
 
@@ -318,13 +313,6 @@ hammer2_freemap_try_alloc(hammer2_chain_t **parentp, hammer2_blockref_t *bref,
 		    HAMMER2_FREEMAP_LEVEL0_RADIX);
 		KKASSERT(start >= 0 && start < HAMMER2_FREEMAP_COUNT);
 		hammer2_chain_modify(chain, mtid, 0, 0);
-		hprintf("TRYALLOC leaf=%px data=%px modified=%d start=%d "
-		    "bmdata[start].linear=%u bitmapq[0]=%016llx avail=%u\n",
-		    chain, chain->data,
-		    !!(chain->flags & HAMMER2_CHAIN_MODIFIED), start,
-		    chain->data->bmdata[start].linear,
-		    (long long)chain->data->bmdata[start].bitmapq[0],
-		    chain->data->bmdata[start].avail);
 
 		error = HAMMER2_ERROR_ENOSPC;
 		for (count = 0; count < HAMMER2_FREEMAP_COUNT; ++count) {
