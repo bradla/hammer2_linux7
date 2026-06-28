@@ -220,7 +220,14 @@ typedef struct hammer2_ioc_volume_list2 hammer2_ioc_volume_list2_t;
 	_IOC(_IOC_READ|_IOC_WRITE, type, nr, sizeof(struct))
 
 /* Ioctl definitions */
-#define HAMMER2IOC_VERSION_GET		HAMMER2_IOR('h', 64, struct hammer2_ioc_version)
+/*
+ * NOTE: VERSION_GET must be _IOWR to match DragonFly and the userland tool
+ * (lh1 hammer2_ioctl.h uses _IOWR).  _IOR here changed the direction bits,
+ * producing a different command number that the ioctl switch never matched,
+ * so every `hammer2` tool command failed at the initial VERSION_GET
+ * validation with "not a hammer2 filesystem".
+ */
+#define HAMMER2IOC_VERSION_GET		HAMMER2_IOWR('h', 64, struct hammer2_ioc_version)
 #define HAMMER2IOC_PFS_GET		HAMMER2_IOWR('h', 80, struct hammer2_ioc_pfs)
 #define HAMMER2IOC_PFS_CREATE		HAMMER2_IOWR('h', 81, struct hammer2_ioc_pfs)
 #define HAMMER2IOC_PFS_DELETE		HAMMER2_IOWR('h', 82, struct hammer2_ioc_pfs)

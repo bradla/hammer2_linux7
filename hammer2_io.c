@@ -183,7 +183,7 @@ hammer2_dev_bread(struct block_device *bdev, loff_t byteoff, void *buf,
 	return (0);
 }
 
-static int
+int
 hammer2_dev_bwrite(struct block_device *bdev, loff_t byteoff, const void *buf,
     int bytes, int sync)
 {

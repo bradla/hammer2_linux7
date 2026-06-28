@@ -839,7 +839,12 @@ hammer2_freemap_adjust(hammer2_dev_t *hmp, hammer2_blockref_t *bref, int how)
 		    (long long)bref->data_off);
 		goto done;
 	}
-	if (chain->error) {
+	/*
+	 * NOTE: chain may legitimately be NULL here when how==DORECOVER (the
+	 * freemap leaf doesn't exist yet and is created below).  Guard the
+	 * error check so we don't dereference a NULL chain.
+	 */
+	if (chain && chain->error) {
 		hprintf("error %d at data_off %016llx\n",
 		    chain->error, (long long)bref->data_off);
 		hammer2_chain_unlock(chain);

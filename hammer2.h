@@ -1377,9 +1377,11 @@ void hammer2_bulkfree_uninit(hammer2_dev_t *hmp);
 void hammer2_bioq_sync(hammer2_pfs_t *pmp);
 struct vop_strategy_args;
 int hammer2_strategy(struct vop_strategy_args *ap);
-/* PAGE_SIZE-chunked device read of a 64K-aligned region (hammer2_io.c). */
+/* PAGE_SIZE-chunked device read/write of a 64K-aligned region (hammer2_io.c). */
 int hammer2_dev_bread(struct block_device *bdev, loff_t byteoff, void *buf,
     int bytes);
+int hammer2_dev_bwrite(struct block_device *bdev, loff_t byteoff,
+    const void *buf, int bytes, int sync);
 int  hammer2_igetv(hammer2_inode_t *ip, int flags, void *vpp);
 struct inode *hammer2_iget(struct super_block *sb, hammer2_inode_t *ip);
 int hammer2_ioctl_linux(struct inode *inode, unsigned long com, void *data,

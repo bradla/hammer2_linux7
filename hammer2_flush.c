@@ -1239,14 +1239,15 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch, int clindex)
 	 * XXX this isn't being incremental
 	 */
 	/*
-	 * Port note: BSD walks the device vnode list, taking VOP_FSYNC on
-	 * each.  Linux equivalent uses sync_blockdev() / blkdev_issue_flush()
-	 * once we have a struct block_device handle on the devvp entry.
-	 * For now, no-op -- proper device sync wiring lands with the mount
-	 * path port.
+	 * Flush the device's dirty buffers (the data/metadata chains written
+	 * during the flush above) to stable storage BEFORE we rewrite the
+	 * volume header.  The volume header is the commit point: it must only
+	 * become live once everything it references is on disk.
 	 */
 	(void)e;
 	(void)devvp;
+	if (hmp->devvp)
+		sync_blockdev(hmp->devvp);
 
 	/*
 	 * The flush code sets CHAIN_VOLUMESYNC to indicate that the
@@ -1281,12 +1282,24 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch, int clindex)
 		    j, (long long)hmp->volsync.volu_size);
 
 		/*
-		 * Port note: BSD writes the volume header via getblk()+bwrite().
-		 * Linux equivalent uses sb_bread()/mark_buffer_dirty/sync_dirty_buffer
-		 * once the per-volume struct block_device handle is wired up.
+		 * Write the synchronized volume header (hmp->volsync) to volume
+		 * header copy `j` at offset j * HAMMER2_ZONE_BYTES64 on the root
+		 * volume device.  This is the commit -- without it, none of the
+		 * flushed changes become live and a remount reads the old tree.
+		 * Written synchronously, after the device sync above.
 		 */
 		(void)blkno;
 		(void)bp;
+		if (hmp->devvp) {
+			int werr = hammer2_dev_bwrite(hmp->devvp,
+			    (loff_t)j * HAMMER2_ZONE_BYTES64,
+			    &hmp->volsync, HAMMER2_VOLUME_BYTES, 1);
+			if (werr)
+				hprintf("volume header %d write failed: %d\n",
+				    j, werr);
+			else
+				sync_blockdev(hmp->devvp);
+		}
 		atomic_clear_int(&hmp->vchain.flags, HAMMER2_CHAIN_VOLUMESYNC);
 		hmp->volhdrno = j;
 	}
