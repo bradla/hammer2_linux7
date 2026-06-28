@@ -42,7 +42,7 @@
  * automatically so two builds of the same version number are still
  * distinguishable.
  */
-#define HAMMER2_PORT_VERSION	"0.13"
+#define HAMMER2_PORT_VERSION	"0.16"
 #define HAMMER2_PORT_BUILD	HAMMER2_PORT_VERSION " built " __DATE__ " " __TIME__
 
 /* BSD-shaped vfsops entry points (un-static'd in hammer2_vfsops.c). */
@@ -715,6 +715,7 @@ hammer2_create_obj(struct inode *dir, struct dentry *dentry, umode_t mode,
 	hammer2_inode_t *nip = NULL;
 	struct inode *inode = NULL;
 	struct vattr va;
+	struct ucred cred;
 	hammer2_tid_t inum;
 	uint64_t mtime;
 	int error;
@@ -724,18 +725,26 @@ hammer2_create_obj(struct inode *dir, struct dentry *dentry, umode_t mode,
 	if (dentry->d_name.len > HAMMER2_INODE_MAXNAME)
 		return ERR_PTR(-ENAMETOOLONG);
 
+	/*
+	 * hammer2_inode_create_normal() dereferences cred (via
+	 * vop_helper_create_uid -> cred->cr_uid), so a real ucred is required.
+	 */
+	memset(&cred, 0, sizeof(cred));
+	cred.uid = from_kuid(&init_user_ns, current_fsuid());
+	cred.gid = from_kgid(&init_user_ns, current_fsgid());
+
 	memset(&va, 0, sizeof(va));
 	va.va_type = hammer2_ifmt_to_dtype(mode);
 	va.va_mode = mode;
-	va.va_uid = from_kuid(&init_user_ns, current_fsuid());
-	va.va_gid = from_kgid(&init_user_ns, current_fsgid());
+	va.va_uid = cred.uid;
+	va.va_gid = cred.gid;
 	va.va_rdev = rdev;
 
 	hammer2_trans_init(pmp, 0);
 	inum = hammer2_trans_newinum(pmp);
 
 	hammer2_inode_lock(dip, 0);
-	nip = hammer2_inode_create_normal(dip, &va, NULL, inum, &error);
+	nip = hammer2_inode_create_normal(dip, &va, &cred, inum, &error);
 	if (error)
 		error = hammer2_error_to_errno(error);
 	else
@@ -1129,6 +1138,56 @@ hammer2_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 }
 
 /* ------------------------------------------------------------------------ */
+/* ioctl								    */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * HAMMER2 ioctls (used by the userland `hammer2` tool: pfs-list, snapshot,
+ * etc.).  The BSD handler (hammer2_ioctl_impl, reached via
+ * hammer2_ioctl_linux) expects the payload already copied into a kernel
+ * buffer, so we marshal it in/out here based on the _IOC_SIZE/_IOC_DIR
+ * encoded in the command (Linux _IOC encoding, which matches the userland
+ * tool built against glibc's <sys/ioctl.h>).
+ */
+static long
+hammer2_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct inode *inode = file_inode(file);
+	void __user *uarg = (void __user *)arg;
+	unsigned int size = _IOC_SIZE(cmd);
+	void *kdata = NULL;
+	int fflag, error;
+
+	if (size > PAGE_SIZE)		/* sanity: all HAMMER2 ioctl structs are small */
+		return -EINVAL;
+	if (size) {
+		kdata = kzalloc(size, GFP_KERNEL);
+		if (!kdata)
+			return -ENOMEM;
+		if ((_IOC_DIR(cmd) & _IOC_WRITE) &&
+		    copy_from_user(kdata, uarg, size)) {
+			kfree(kdata);
+			return -EFAULT;
+		}
+	}
+
+	/* BSD fflag bits: FREAD = 1, FWRITE = 2. */
+	fflag = ((file->f_mode & FMODE_READ) ? 1 : 0) |
+		((file->f_mode & FMODE_WRITE) ? 2 : 0);
+
+	error = hammer2_ioctl_linux(inode, cmd, kdata, fflag);
+	if (error > 0)
+		error = -error;		/* BSD positive errno -> Linux negative */
+
+	if (error == 0 && size && (_IOC_DIR(cmd) & _IOC_READ) &&
+	    copy_to_user(uarg, kdata, size))
+		error = -EFAULT;
+
+	kfree(kdata);
+	return error;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Superblock operations						    */
 /* ------------------------------------------------------------------------ */
 
@@ -1259,6 +1318,8 @@ static const struct file_operations hammer2_dir_fops = {
 	.iterate_shared	= hammer2_iterate,
 	.llseek		= generic_file_llseek,
 	.fsync		= hammer2_fsync,
+	.unlocked_ioctl	= hammer2_unlocked_ioctl,
+	.compat_ioctl	= compat_ptr_ioctl,
 };
 
 static const struct file_operations hammer2_file_fops = {
@@ -1266,6 +1327,8 @@ static const struct file_operations hammer2_file_fops = {
 	.read_iter	= hammer2_read_iter,
 	.write_iter	= hammer2_write_iter,
 	.fsync		= hammer2_fsync,
+	.unlocked_ioctl	= hammer2_unlocked_ioctl,
+	.compat_ioctl	= compat_ptr_ioctl,
 };
 
 /* ------------------------------------------------------------------------ */

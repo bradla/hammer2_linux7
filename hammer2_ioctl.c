@@ -1148,3 +1148,17 @@ hammer2_ioctl_impl(struct vnode *vp, unsigned long com, void *data, int fflag,
 
 	return (error);
 }
+
+/*
+ * Linux ioctl entry point.  The Linux VFS glue (hammer2_linux_vfs.c) copies
+ * the ioctl payload in/out of userspace and calls this with a kernel `data`
+ * buffer, mirroring the BSD ioctl convention that hammer2_ioctl_impl()
+ * expects.  cred is unused by the handlers, so NULL is fine.
+ */
+int
+hammer2_ioctl_linux(struct inode *inode, unsigned long com, void *data,
+    int fflag)
+{
+	/* void * converts implicitly to the impl's (struct vnode *) param. */
+	return (hammer2_ioctl_impl((void *)inode, com, data, fflag, NULL));
+}

@@ -1382,6 +1382,8 @@ int hammer2_dev_bread(struct block_device *bdev, loff_t byteoff, void *buf,
     int bytes);
 int  hammer2_igetv(hammer2_inode_t *ip, int flags, void *vpp);
 struct inode *hammer2_iget(struct super_block *sb, hammer2_inode_t *ip);
+int hammer2_ioctl_linux(struct inode *inode, unsigned long com, void *data,
+    int fflag);
 #define wakeup(c)	hammer2_mtx_wakeup((void *)(c))
 
 #endif /* !_HAMMER2_H_ */

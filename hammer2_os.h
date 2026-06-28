@@ -22,9 +22,22 @@
  * Lock primitive typedefs.  These are referenced by hammer2.h and must be
  * defined before any of the inline helpers below.
  */
+/*
+ * RECURSIVE mutex shim.  HAMMER2's chain/inode locks are taken recursively by
+ * the same thread (e.g. an embedded-data inode whose chain_lookup re-locks the
+ * inode chain).  A plain Linux mutex is non-recursive and self-deadlocks on
+ * that, so we track the owning task and a recursion depth: the underlying
+ * mutex is physically acquired only on the 0->1 transition and released on the
+ * 1->0 transition.  Shared and exclusive are both modeled as exclusive holds.
+ *
+ * `depth` is only ever modified by the owning thread while holding the mutex
+ * (or transitioning ownership), so it needs no atomics; `owner` is published
+ * with WRITE_ONCE/READ_ONCE for cross-thread visibility of the != current test.
+ */
 struct hammer2_mtx_wrapper {
-	struct mutex	lock;
-	atomic_t	refs;
+	struct mutex		lock;
+	struct task_struct	*owner;
+	int			depth;
 };
 typedef struct hammer2_mtx_wrapper	hammer2_mtx_t;
 
@@ -32,50 +45,51 @@ typedef struct rw_semaphore		hammer2_lk_t;
 typedef wait_queue_head_t		hammer2_lkc_t;
 typedef spinlock_t			hammer2_spin_t;
 
-/*
- * Mutex shim with reference counting.  BSD lockmgr() distinguishes between
- * recursive and non-recursive holds; Linux mutex_lock() does not, so we
- * approximate by tracking an explicit refcount alongside the mutex.
- */
 static inline void
 hammer2_mtx_init(hammer2_mtx_t *p, const char *s)
 {
 	mutex_init(&p->lock);
-	atomic_set(&p->refs, 0);
+	p->owner = NULL;
+	p->depth = 0;
 }
 
 static inline void
 hammer2_mtx_init_recurse(hammer2_mtx_t *p, const char *s)
 {
-	mutex_init(&p->lock);
-	atomic_set(&p->refs, 0);
+	hammer2_mtx_init(p, s);
 }
 
 static inline void
 hammer2_mtx_ex(hammer2_mtx_t *p)
 {
+	if (READ_ONCE(p->owner) == current) {
+		++p->depth;
+		return;
+	}
 	mutex_lock(&p->lock);
-	atomic_inc(&p->refs);
+	WRITE_ONCE(p->owner, current);
+	p->depth = 1;
 }
 
 static inline void
 hammer2_mtx_sh(hammer2_mtx_t *p)
 {
-	mutex_lock(&p->lock);
-	atomic_inc(&p->refs);
+	hammer2_mtx_ex(p);
 }
 
 static inline void
 hammer2_mtx_unlock(hammer2_mtx_t *p)
 {
-	atomic_dec(&p->refs);
-	mutex_unlock(&p->lock);
+	if (--p->depth == 0) {
+		WRITE_ONCE(p->owner, NULL);
+		mutex_unlock(&p->lock);
+	}
 }
 
 static inline int
 hammer2_mtx_refs(hammer2_mtx_t *p)
 {
-	return atomic_read(&p->refs);
+	return p->depth;
 }
 
 static inline void
@@ -94,20 +108,21 @@ hammer2_mtx_destroy(hammer2_mtx_t *p)
 static inline int
 hammer2_mtx_sleep(void *c, hammer2_mtx_t *p, const char *s, int timo)
 {
-	int refs = atomic_read(&p->refs);
+	int depth = p->depth;
 
 	(void)c;
 	(void)s;
 
-	while (atomic_read(&p->refs) > 0) {
-		mutex_unlock(&p->lock);
-		atomic_dec(&p->refs);
-	}
+	/* Fully release (regardless of recursion depth), sleep, reacquire. */
+	p->depth = 0;
+	WRITE_ONCE(p->owner, NULL);
+	mutex_unlock(&p->lock);
 
 	schedule_timeout_uninterruptible(timo ? timo : 1);
 
 	mutex_lock(&p->lock);
-	atomic_set(&p->refs, refs);
+	WRITE_ONCE(p->owner, current);
+	p->depth = depth;
 	return 0;
 }
 
@@ -121,14 +136,19 @@ hammer2_mtx_wakeup(void *c)
 static inline int
 hammer2_mtx_owned(hammer2_mtx_t *p)
 {
-	return mutex_is_locked(&p->lock);
+	return READ_ONCE(p->owner) == current;
 }
 
 static inline int
 hammer2_mtx_ex_try(hammer2_mtx_t *p)
 {
+	if (READ_ONCE(p->owner) == current) {
+		++p->depth;
+		return 0;
+	}
 	if (mutex_trylock(&p->lock)) {
-		atomic_inc(&p->refs);
+		WRITE_ONCE(p->owner, current);
+		p->depth = 1;
 		return 0;
 	}
 	return 1;
@@ -159,12 +179,11 @@ hammer2_mtx_upgrade_try(hammer2_mtx_t *p)
 static inline int
 hammer2_mtx_temp_release(hammer2_mtx_t *p)
 {
-	int x = atomic_read(&p->refs);
+	int x = p->depth;
 
-	while (atomic_read(&p->refs) > 0) {
-		mutex_unlock(&p->lock);
-		atomic_dec(&p->refs);
-	}
+	p->depth = 0;
+	WRITE_ONCE(p->owner, NULL);
+	mutex_unlock(&p->lock);
 	return x;
 }
 
@@ -172,7 +191,8 @@ static inline void
 hammer2_mtx_temp_restore(hammer2_mtx_t *p, int x)
 {
 	mutex_lock(&p->lock);
-	atomic_set(&p->refs, x);
+	WRITE_ONCE(p->owner, current);
+	p->depth = x;
 }
 
 /*
@@ -206,7 +226,7 @@ hammer2_mtx_temp_restore(hammer2_mtx_t *p, int x)
  * semantics aren't reproducible.  We approximate by simply warning if the
  * mutex is currently locked at all.
  */
-#define hammer2_mtx_assert_unlocked(p)	WARN_ON(mutex_is_locked(&(p)->lock))
+#define hammer2_mtx_assert_unlocked(p)	WARN_ON(READ_ONCE((p)->owner) == current)
 
 /*
  * Condition-variable style sleep/wakeup.  hammer2_lkc_t is a
