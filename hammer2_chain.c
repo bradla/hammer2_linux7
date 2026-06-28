@@ -79,6 +79,92 @@ RB_GENERATE(hammer2_chain_tree, hammer2_chain, rbnode, hammer2_chain_cmp);
 RB_GENERATE_SCAN(hammer2_chain_tree, hammer2_chain, rbnode);
 
 /*
+ * Real Linux-rbtree backing for the BSD RB_* macros used by the chain code.
+ * The generic <sys/tree.h> generator was stubbed out during the Linux port,
+ * so the in-memory chain cache (insert + lookup + flush recursion) relied on
+ * no-op macros and never actually indexed anything.  These functions provide
+ * the genuine behavior, keyed by hammer2_chain_cmp().
+ *
+ * hammer2_chain_rb_insert: link elm into the tree; returns the colliding
+ *	chain (and does not insert) if an overlapping key already exists,
+ *	otherwise NULL.  Matches the BSD RB_INSERT contract.
+ *
+ * hammer2_chain_rb_scan: ordered range scan.  cmp==NULL visits every node
+ *	(used by the flush recursion); otherwise cmp(node,arg) returns <0 if
+ *	the node sorts entirely before the target range, >0 if entirely after,
+ *	and 0 on overlap, with cb() invoked for each overlapping node.  The
+ *	in-order successor is pre-fetched before cb() so the callback may
+ *	safely unlink the node it is handed (as the flush code does).  A
+ *	negative cb() return stops the scan, mirroring BSD RB_SCAN.
+ */
+hammer2_chain_t *
+hammer2_chain_rb_insert(struct hammer2_chain_tree *tree, hammer2_chain_t *elm)
+{
+	struct rb_node **pp = &tree->root.rb_node;
+	struct rb_node *parent = NULL;
+	hammer2_chain_t *cur;
+	int c;
+
+	while (*pp) {
+		parent = *pp;
+		cur = rb_entry(parent, hammer2_chain_t, rbnode);
+		c = hammer2_chain_cmp(elm, cur);
+		if (c < 0)
+			pp = &parent->rb_left;
+		else if (c > 0)
+			pp = &parent->rb_right;
+		else
+			return (cur);		/* collision, not inserted */
+	}
+	rb_link_node(&elm->rbnode, parent, pp);
+	rb_insert_color(&elm->rbnode, &tree->root);
+	return (NULL);
+}
+
+void
+hammer2_chain_rb_scan(struct hammer2_chain_tree *tree,
+    int (*cmp)(hammer2_chain_t *, void *),
+    int (*cb)(hammer2_chain_t *, void *), void *arg)
+{
+	struct rb_node *node, *next;
+	hammer2_chain_t *c;
+
+	if (cmp == NULL) {
+		/* Visit every node in order (flush recursion). */
+		for (node = rb_first(&tree->root); node; node = next) {
+			c = rb_entry(node, hammer2_chain_t, rbnode);
+			next = rb_next(node);
+			if (cb(c, arg) < 0)
+				break;
+		}
+		return;
+	}
+
+	/* Descend to the leftmost node not entirely left of the range. */
+	node = tree->root.rb_node;
+	next = NULL;
+	while (node) {
+		c = rb_entry(node, hammer2_chain_t, rbnode);
+		if (cmp(c, arg) < 0) {
+			node = node->rb_right;
+		} else {
+			next = node;
+			node = node->rb_left;
+		}
+	}
+
+	/* Walk forward across the overlapping range. */
+	for (node = next; node; node = next) {
+		c = rb_entry(node, hammer2_chain_t, rbnode);
+		next = rb_next(node);
+		if (cmp(c, arg) > 0)
+			break;
+		if (cb(c, arg) < 0)
+			break;
+	}
+}
+
+/*
  * Assert that a chain has no media data associated with it.
  */
 static __inline void

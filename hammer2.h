@@ -152,23 +152,26 @@ struct hammer2_rb_node {
 #define RB_ENTRY(type) struct rb_node
 #define RB_INIT(rp) do { (rp)->root = RB_ROOT; } while (0)
 /*
- * RB_INSERT in BSD inserts elm into the tree using a registered cmp fn.
- * Linux's rbtree API requires the caller to walk down to the insertion
- * point and call rb_link_node()+rb_insert_color() themselves; there is no
- * generic rb_insert() helper.  HAMMER2 call sites already do the walk via
- * hammer2_chain_insert(), so this macro is intentionally unused; provide
- * a stub for any remaining textual references.
+ * BSD's intrusive RB tree implemented on top of Linux's <linux/rbtree.h>.
+ * The generic <sys/tree.h> generator does not exist on Linux, so the real
+ * insert/scan logic lives in hammer2_chain.c (hammer2_chain_rb_insert /
+ * hammer2_chain_rb_scan), keyed by hammer2_chain_cmp().  These macros simply
+ * forward to those helpers.  The only RB tree in the port is the per-core
+ * chain tree, so hardcoding the chain element type here is safe.
+ *
+ * RB_INSERT returns NULL on success or the colliding element on collision.
  */
-/*
- * Returns NULL on success, or the colliding element on collision.  Without
- * the BSD-generated cmp/walk logic we cannot detect collisions here -- the
- * port currently performs the actual insert via hammer2_chain_insert(),
- * leaving this textual stub for any straggler call sites.
- */
-#define RB_INSERT(name, hp, elm) \
-	((void *)0)
+struct hammer2_chain;
+struct hammer2_chain_tree;
+struct hammer2_chain *hammer2_chain_rb_insert(struct hammer2_chain_tree *,
+    struct hammer2_chain *);
+void hammer2_chain_rb_scan(struct hammer2_chain_tree *,
+    int (*)(struct hammer2_chain *, void *),
+    int (*)(struct hammer2_chain *, void *), void *);
+
+#define RB_INSERT(name, hp, elm)	hammer2_chain_rb_insert((hp), (elm))
 #define RB_REMOVE(name, hp, elm)	rb_erase(&(elm)->rbnode, &(hp)->root)
-#define RB_SCAN(name, hp, cmp, cb, arg)	do { (void)(hp); } while (0)
+#define RB_SCAN(name, hp, cmp, cb, arg)	hammer2_chain_rb_scan((hp), (cmp), (cb), (arg))
 
 /* Forward declarations */
 struct hammer2_io;
@@ -482,7 +485,13 @@ hammer2_chain_t *hammer2_inode_chain_and_parent(hammer2_inode_t *ip,
 #define RB_EMPTY(tree)			RB_EMPTY_ROOT(&(tree)->root)
 #define RB_FIRST(name, root)		rb_first(&(root)->root)
 #define RB_NEXT(name, root, elm)	rb_next(&(elm)->rbnode)
-#define RB_FOREACH(var, name, root)	/* iterator -- caller-specific */
+#define RB_MIN(name, hp)						\
+	(RB_EMPTY_ROOT(&(hp)->root) ? NULL :				\
+	    rb_entry(rb_first(&(hp)->root), hammer2_chain_t, rbnode))
+#define RB_FOREACH(var, name, hp)					\
+	for ((var) = RB_MIN(name, (hp)); (var) != NULL;			\
+	     (var) = ({ struct rb_node *_rbn = rb_next(&(var)->rbnode);	\
+		_rbn ? rb_entry(_rbn, hammer2_chain_t, rbnode) : NULL; }))
 
 /* DragonFly's pause(msg, ticks) -> Linux cond_resched + msleep. */
 #define pause(msg, ticks) \
